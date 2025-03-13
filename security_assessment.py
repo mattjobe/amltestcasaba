@@ -11,6 +11,49 @@ import base64
 from pathlib import Path
 import traceback
 
+# Add robust file writing with multiple fallback locations
+def save_results_with_fallback(report):
+    """Try to save results to multiple locations if the primary fails"""
+    possible_locations = [
+        "/tmp/security_assessment.json",
+        "./security_assessment.json",
+        os.path.join(os.path.expanduser("~"), "security_assessment.json"),
+        os.path.join(os.getcwd(), "security_assessment.json")
+    ]
+    
+    # Add the AZUREML_SCRIPT_DIRECTORY location if it exists (common in AML)
+    if "AZUREML_SCRIPT_DIRECTORY" in os.environ:
+        possible_locations.insert(0, os.path.join(os.environ["AZUREML_SCRIPT_DIRECTORY"], "security_assessment.json"))
+    
+    success = False
+    saved_path = None
+    
+    for location in possible_locations:
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(location), exist_ok=True)
+            
+            # Try to write to this location
+            with open(location, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+            
+            # Verify the file was written
+            if os.path.exists(location) and os.path.getsize(location) > 0:
+                print(f"Results successfully saved to: {location}")
+                success = True
+                saved_path = location
+                break
+        except Exception as e:
+            print(f"Failed to save to {location}: {str(e)}")
+    
+    if not success:
+        print("WARNING: Failed to save results to any location!")
+        # As a last resort, print to stdout
+        print("--- SECURITY ASSESSMENT RESULTS ---")
+        print(json.dumps(report, indent=2, default=str))
+    
+    return saved_path
+
 def run_command(command):
     """Run a shell command and return output"""
     try:
@@ -284,18 +327,26 @@ def check_filesystem_permissions():
     
     return results
 
-# NEW FUNCTIONS BELOW
-
 def check_container_boundaries():
     """Test container isolation boundaries"""
     results = {}
     
     # Check for container indicators
-    results["container_detection"] = {
-        "cgroup": run_command("cat /proc/self/cgroup"),
-        "docker_env": run_command("grep -q docker /proc/1/cgroup && echo 'Docker detected' || echo 'No Docker'"),
-        "is_container": os.path.exists("/.dockerenv") or any("docker" in line for line in open("/proc/1/cgroup").readlines() if "docker" in line)
-    }
+    try:
+        cgroup_content = ""
+        if os.path.exists("/proc/self/cgroup"):
+            with open("/proc/self/cgroup", 'r') as f:
+                cgroup_content = f.read()
+        
+        results["container_detection"] = {
+            "cgroup": {"stdout": cgroup_content},
+            "docker_env": run_command("grep -q docker /proc/1/cgroup 2>/dev/null && echo 'Docker detected' || echo 'No Docker'"),
+            "is_container": os.path.exists("/.dockerenv") or 
+                           (os.path.exists("/proc/1/cgroup") and 
+                            any("docker" in line for line in open("/proc/1/cgroup").readlines() if "docker" in line))
+        }
+    except Exception as e:
+        results["container_detection"] = {"error": str(e)}
     
     # Test access to host devices
     results["device_access"] = run_command("ls -la /dev/")
@@ -331,7 +382,6 @@ def extract_and_test_tokens():
             # Just get the header part to identify token type
             parts = v.split('.')
             if len(parts) >= 2:
-                import base64
                 padding = '=' * (4 - len(parts[0]) % 4)
                 header = json.loads(base64.b64decode(parts[0] + padding).decode('utf-8'))
                 token_info[k] = {
@@ -361,13 +411,14 @@ def extract_and_test_tokens():
             resource = endpoint.split('/')[2]
             token_resp = requests.get(
                 f"{os.environ.get('MSI_ENDPOINT', 'http://169.254.169.254/metadata/identity/oauth2/token')}?resource=https://{resource}",
-                headers={"Metadata": "true", "Secret": os.environ.get("MSI_SECRET", "")}
+                headers={"Metadata": "true", "Secret": os.environ.get("MSI_SECRET", "")},
+                timeout=5
             )
             if token_resp.status_code == 200:
                 token = token_resp.json().get("access_token", "")
                 
                 # Now test the token against the endpoint
-                resp = requests.get(endpoint, headers={"Authorization": f"Bearer {token}"})
+                resp = requests.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=5)
                 msi_tests[resource] = {
                     "status_code": resp.status_code,
                     "has_access": resp.status_code < 300,
@@ -396,14 +447,14 @@ def extensive_network_scan():
     }
     results["outbound_connectivity"] = outbound_tests
     
-    # Scan internal networks more thoroughly
+    # Scan internal networks more thoroughly (limiting scope to avoid excessive scanning)
     internal_ranges = ["10.0.0", "172.16.0", "172.17.0", "192.168.0"]
     internal_scan = {}
     
     for prefix in internal_ranges:
         hosts = {}
-        # Only scan first 10 hosts in each range for brevity
-        for i in range(1, 10):
+        # Only scan first 5 hosts in each range for brevity and to avoid excessive scanning
+        for i in range(1, 5):
             ip = f"{prefix}.{i}"
             ping_result = run_command(f"ping -c 1 -W 1 {ip}")
             hosts[ip] = {
@@ -535,11 +586,12 @@ def check_data_access_and_logging():
     
     return results
 
-# Update the main function to include new tests
+# Update the main function to include new tests and better error handling
 def run_security_assessment():
     """Run all security checks and compile results"""
     start_time = datetime.datetime.now()
     
+    # Initialize empty report structure
     report = {
         "timestamp": start_time.isoformat(),
         "compute_info": {
@@ -548,31 +600,39 @@ def run_security_assessment():
             "python_version": sys.version,
             "cpu_count": os.cpu_count(),
             "uuid": str(uuid.uuid4())  # Generate a unique ID for this report
-        },
-        "environment_variables": check_environment_variables(),
-        "network_access": check_network_access(),
-        "file_access": check_file_access(),
-        "cloud_access": check_cloud_access(),
-        "process_privileges": check_process_privileges(),
-        "port_scan": network_port_scan(),
-        "filesystem_permissions": check_filesystem_permissions(),
-        
-        # Add the new extended tests
-        "container_boundaries": check_container_boundaries(),
-        "identity_testing": extract_and_test_tokens(),
-        "extended_network": extensive_network_scan(),
-        "data_access": check_data_access_and_logging()
+        }
     }
+    
+    # List of test functions to run with proper error handling
+    test_functions = [
+        ("environment_variables", check_environment_variables),
+        ("network_access", check_network_access),
+        ("file_access", check_file_access),
+        ("cloud_access", check_cloud_access),
+        ("process_privileges", check_process_privileges),
+        ("port_scan", network_port_scan),
+        ("filesystem_permissions", check_filesystem_permissions),
+        ("container_boundaries", check_container_boundaries),
+        ("identity_testing", extract_and_test_tokens),
+        ("extended_network", extensive_network_scan),
+        ("data_access", check_data_access_and_logging)
+    ]
+    
+    # Run each test with proper error handling
+    for section_name, test_function in test_functions:
+        try:
+            print(f"Running test: {section_name}...")
+            report[section_name] = test_function()
+        except Exception as e:
+            print(f"ERROR in {section_name}: {str(e)}")
+            traceback.print_exc()
+            report[section_name] = {"error": str(e), "traceback": traceback.format_exc()}
     
     end_time = datetime.datetime.now()
     report["execution_time_seconds"] = (end_time - start_time).total_seconds()
     
-    # Save results to a file
-    output_path = "/tmp/security_assessment.json"
-    with open(output_path, "w") as f:
-        json.dump(report, f, indent=2, default=str)
-    
-    print(f"Security assessment complete. Results saved to: {output_path}")
+    # Save results to a file with multiple fallback options
+    output_path = save_results_with_fallback(report)
     
     # Print summary
     print("\n=== SECURITY ASSESSMENT SUMMARY ===")
@@ -580,35 +640,82 @@ def run_security_assessment():
     print(f"Platform: {report['compute_info']['platform']}")
     print(f"Environment Variables: {report['environment_variables']['count']} found")
     print(f"Sensitive Variables: {len(report['environment_variables']['sensitive_variables'])} identified")
-    print(f"IMDS Access: {'Available' if report['network_access'].get('169.254.169.254', {}).get('imds_access', {}).get('status_code') == 200 else 'Unavailable'}")
-    print(f"Container Escape Tests: {len([x for x in report['container_boundaries']['readonly_paths'].values() if 'successful' in x.get('stdout', '').lower()])}")
-    print(f"MSI Access: {', '.join([k for k, v in report['identity_testing']['msi_access_tests'].items() if v.get('has_access')])}")
+    
+    # Print IMDS access status with proper error handling
+    imds_status = "Unknown"
+    try:
+        if report['network_access'].get('169.254.169.254', {}).get('imds_access', {}).get('status_code') == 200:
+            imds_status = "Available"
+        else:
+            imds_status = "Unavailable"
+    except:
+        imds_status = "Error checking"
+    print(f"IMDS Access: {imds_status}")
+    
+    # Print container escape test results with proper error handling
+    container_escape_tests = 0
+    try:
+        container_escape_tests = len([x for x in report['container_boundaries']['readonly_paths'].values() 
+                                     if 'successful' in x.get('stdout', '').lower()])
+    except:
+        container_escape_tests = "Error checking"
+    print(f"Container Escape Tests: {container_escape_tests}")
+    
+    # Print MSI access status with proper error handling
+    msi_access = []
+    try:
+        msi_access = [k for k, v in report['identity_testing']['msi_access_tests'].items() if v.get('has_access')]
+    except:
+        msi_access = ["Error checking"]
+    print(f"MSI Access: {', '.join(msi_access)}")
+    
+    # Print output path
+    if output_path:
+        print(f"\nResults saved to: {output_path}")
     
     # Return full report
-    return report
+    return report, output_path
 
 if __name__ == "__main__":
     try:
-        report = run_security_assessment()
+        print("Starting security assessment...")
+        report, output_path = run_security_assessment()
         
-        # Optionally, upload results to blob storage or another external location
-        # This would be useful if you want to compare results between different compute resources
+        # Print a confirmation message with the output path
+        if output_path:
+            print(f"\nSecurity assessment complete. Results saved to: {output_path}")
+            # Print file size to confirm it was written correctly
+            if os.path.exists(output_path):
+                print(f"Output file size: {os.path.getsize(output_path)} bytes")
+            else:
+                print(f"WARNING: Output file not found at {output_path} after writing!")
+        else:
+            print("WARNING: Failed to save results to a file!")
         
         # For demo purposes, print a compact version of the most important findings
-        important_findings = {
-            "compute_info": report["compute_info"],
-            "imds_access": report["network_access"].get("169.254.169.254", {}).get("imds_access", {}),
-            "sudo_access": report["process_privileges"]["sudo_access"]["returncode"] == 0,
-            "docker_access": report["process_privileges"]["docker_access"]["returncode"] == 0,
-            "sensitive_env_count": len(report["environment_variables"]["sensitive_variables"]),
-            "arm_access": report["cloud_access"].get("arm_access", {}),
-            "container_escape_possible": any('successful' in x.get('stdout', '').lower() for x in report['container_boundaries']['readonly_paths'].values()),
-            "msi_resources_accessible": [k for k, v in report['identity_testing']['msi_access_tests'].items() if v.get('has_access')],
-            "credential_files_found": sum(len(files) for files in report['data_access']['potential_credential_files'].values())
-        }
+        try:
+            important_findings = {
+                "compute_info": report["compute_info"],
+                "imds_access": report["network_access"].get("169.254.169.254", {}).get("imds_access", {}),
+                "sudo_access": report["process_privileges"]["sudo_access"]["returncode"] == 0,
+                "docker_access": report["process_privileges"]["docker_access"]["returncode"] == 0,
+                "sensitive_env_count": len(report["environment_variables"]["sensitive_variables"]),
+                "arm_access": report["cloud_access"].get("arm_access", {}),
+                "container_escape_possible": any('successful' in x.get('stdout', '').lower() 
+                                               for x in report['container_boundaries']['readonly_paths'].values()),
+                "msi_resources_accessible": [k for k, v in report['identity_testing']['msi_access_tests'].items() 
+                                           if v.get('has_access')],
+                "credential_files_found": sum(len(files) for files in report['data_access']['potential_credential_files'].values())
+            }
+            
+            print("\n=== CRITICAL FINDINGS ===")
+            print(json.dumps(important_findings, indent=2, default=str))
+        except Exception as e:
+            print(f"Error generating summary: {str(e)}")
         
-        print("\n=== CRITICAL FINDINGS ===")
-        print(json.dumps(important_findings, indent=2, default=str))
+        # Exit with success
+        print("\nAssessment complete with exit code: 0")
+        sys.exit(0)
         
     except Exception as e:
         print(f"Error during security assessment: {str(e)}")
