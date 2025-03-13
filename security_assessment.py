@@ -1013,7 +1013,7 @@ def run_lateral_movement_assessment():
     report["execution_time_seconds"] = (end_time - start_time).total_seconds()
     
     # Save results to a file
-    output_path = "./lateral_movement_assessment.json"
+    output_path = "./security_assessment.json"
     with open(output_path, "w") as f:
         json.dump(report, f, indent=2, default=str)
     
