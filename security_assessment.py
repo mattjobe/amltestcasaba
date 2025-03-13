@@ -98,159 +98,6 @@ def discover_network():
     
     return results
 
-def run_lateral_movement_assessment():
-    """Run all lateral movement tests and compile results"""
-    start_time = datetime.datetime.now()
-    
-    print("Starting lateral movement assessment...")
-    
-    report = {
-        "timestamp": start_time.isoformat(),
-        "compute_info": {
-            "hostname": socket.gethostname(),
-            "platform": platform.platform(),
-            "python_version": sys.version,
-            "cpu_count": os.cpu_count(),
-            "uuid": str(uuid.uuid4())  # Generate a unique ID for this report
-        },
-        "network_discovery": discover_network(),
-        "kubernetes_access": test_kubernetes_access(),
-        "managed_identity_access": test_managed_identity_access(),
-        "container_escape": test_docker_escape(),
-        "metadata_services": test_metadata_services(),
-        "unprotected_services": scan_for_unprotected_services(),
-        "credential_leaks": test_for_credential_leaks(),
-        "storage_access": test_for_storage_access(),
-        "aml_specific": test_aml_specific_vectors()
-    }
-    
-    end_time = datetime.datetime.now()
-    report["execution_time_seconds"] = (end_time - start_time).total_seconds()
-    
-    # Save results to a file
-    output_path = "/tmp/lateral_movement_assessment.json"
-    with open(output_path, "w") as f:
-        json.dump(report, f, indent=2, default=str)
-    
-    print(f"Lateral movement assessment complete. Results saved to: {output_path}")
-    
-    # Print summary
-    print("\n=== LATERAL MOVEMENT ASSESSMENT SUMMARY ===")
-    print(f"Hostname: {report['compute_info']['hostname']}")
-    print(f"Platform: {report['compute_info']['platform']}")
-    
-    # Network summary
-    subnets = report['network_discovery'].get('local_subnets', [])
-    hosts = report['network_discovery'].get('known_hosts', [])
-    print(f"Network: {len(subnets)} subnets, {len(hosts)} hosts discovered")
-    
-    # Kubernetes access
-    k8s_access = report['kubernetes_access'].get('kubernetes_service_accessible', False)
-    print(f"Kubernetes Access: {'Available' if k8s_access else 'Not Available'}")
-    
-    # Managed Identity
-    arm_token = report['managed_identity_access'].get('arm_token_acquired', False)
-    print(f"Managed Identity ARM Access: {'Available' if arm_token else 'Not Available'}")
-    
-    # Container status
-    in_container = report['container_escape'].get('in_container', False)
-    print(f"Container Status: {'Inside Container' if in_container else 'Not in Container'}")
-    
-    # Metadata services
-    imds_access = report['metadata_services'].get('azure_imds', {}).get('accessible', False)
-    print(f"IMDS Access: {'Available' if imds_access else 'Not Available'}")
-    
-    # Credential leaks
-    cred_count = report['credential_leaks'].get('credential_files', {}).get('count', 0)
-    print(f"Potential Credential Files: {cred_count}")
-    
-    # Storage access
-    storage_token = report['storage_access'].get('storage_token_acquired', False)
-    storage_accounts = len(report['storage_access'].get('storage_accounts_found', []))
-    print(f"Storage Access: {'Available' if storage_token else 'Not Available'} ({storage_accounts} accounts found)")
-    
-    # AML specific
-    ml_workspaces = 0
-    if 'ml_workspaces' in report.get('aml_specific', {}):
-        for sub_id, sub_data in report['aml_specific']['ml_workspaces'].items():
-            ml_workspaces += sub_data.get('count', 0)
-    
-    print(f"Azure ML Workspaces Accessible: {ml_workspaces}")
-    
-    # Identify critical findings for lateral movement
-    print("\n=== CRITICAL LATERAL MOVEMENT VECTORS ===")
-    
-    critical_findings = []
-    
-    # Check for docker socket access (container escape)
-    if report['container_escape'].get('docker_socket_mounted', False):
-        critical_findings.append("Docker socket mounted - potential container escape")
-    
-    # Check for privileged container
-    privileged = any(v.get('writable', False) for k, v in 
-                    report['container_escape'].get('privileged_indicators', {}).items())
-    if privileged:
-        critical_findings.append("Container running in privileged mode - potential host access")
-    
-    # Check for suspicious mounts
-    if report['container_escape'].get('suspicious_mounts', []):
-        critical_findings.append(f"Suspicious host paths mounted: {len(report['container_escape']['suspicious_mounts'])} found")
-    
-    # Check for unprotected services
-    for service, data in report['unprotected_services'].get('localhost', {}).items():
-        if data.get('accessible', False):
-            critical_findings.append(f"Unprotected {service} service accessible locally")
-    
-    # Check for exposed services on subnet
-    if 'live_hosts' in report['unprotected_services'].get('subnet_scan', {}):
-        live_host_count = len(report['unprotected_services']['subnet_scan']['live_hosts'])
-        if live_host_count > 1:  # More than just localhost
-            critical_findings.append(f"Multiple live hosts ({live_host_count}) found on local subnet")
-            
-            # Check for critical ports
-            critical_port_hosts = []
-            for host, port_data in report['unprotected_services']['subnet_scan'].get('port_scan', {}).items():
-                for port, port_info in port_data.items():
-                    if port_info.get('state', '') == 'OPEN' and port in [22, 6379, 6443, 10250, 27017]:
-                        critical_port_hosts.append(f"{host}:{port}")
-            
-            if critical_port_hosts:
-                critical_findings.append(f"Critical ports open on network: {', '.join(critical_port_hosts[:5])}")
-    
-    # Check for storage account access
-    storage_results = report['storage_access'].get('storage_access_results', {})
-    for account, account_data in storage_results.items():
-        if account_data.get('containers', {}).get('accessible', False):
-            critical_findings.append(f"Storage account {account} containers accessible")
-    
-    # Check for kubernetes access
-    if report['kubernetes_access'].get('kubernetes_service_accessible', False):
-        critical_findings.append("Kubernetes API accessible")
-    
-    # Check for AML workspace access
-    if 'ml_workspaces' in report.get('aml_specific', {}):
-        for sub_id, sub_data in report['aml_specific']['ml_workspaces'].items():
-            for ws in sub_data.get('workspaces', []):
-                if ws.get('compute_access', {}).get('accessible', False):
-                    critical_findings.append(f"AML workspace {ws['name']} compute resources accessible")
-    
-    # Print critical findings
-    if critical_findings:
-        for finding in critical_findings:
-            print(f"- {finding}")
-    else:
-        print("No critical lateral movement vectors identified")
-    
-    return report
-
-if __name__ == "__main__":
-    try:
-        report = run_lateral_movement_assessment()
-    except Exception as e:
-        print(f"Error during lateral movement assessment: {str(e)}")
-        traceback.print_exc()
-        sys.exit(1)
-
 def scan_subnet(subnet, ports_to_scan=None):
     """Scan a subnet for hosts and open ports"""
     if ports_to_scan is None:
@@ -1135,3 +982,156 @@ def test_for_storage_access():
         results["storage_access_results"] = access_results
     
     return results
+
+def run_lateral_movement_assessment():
+    """Run all lateral movement tests and compile results"""
+    start_time = datetime.datetime.now()
+    
+    print("Starting lateral movement assessment...")
+    
+    report = {
+        "timestamp": start_time.isoformat(),
+        "compute_info": {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "python_version": sys.version,
+            "cpu_count": os.cpu_count(),
+            "uuid": str(uuid.uuid4())  # Generate a unique ID for this report
+        },
+        "network_discovery": discover_network(),
+        "kubernetes_access": test_kubernetes_access(),
+        "managed_identity_access": test_managed_identity_access(),
+        "container_escape": test_docker_escape(),
+        "metadata_services": test_metadata_services(),
+        "unprotected_services": scan_for_unprotected_services(),
+        "credential_leaks": test_for_credential_leaks(),
+        "storage_access": test_for_storage_access(),
+        "aml_specific": test_aml_specific_vectors()
+    }
+    
+    end_time = datetime.datetime.now()
+    report["execution_time_seconds"] = (end_time - start_time).total_seconds()
+    
+    # Save results to a file
+    output_path = "/tmp/lateral_movement_assessment.json"
+    with open(output_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    
+    print(f"Lateral movement assessment complete. Results saved to: {output_path}")
+    
+    # Print summary
+    print("\n=== LATERAL MOVEMENT ASSESSMENT SUMMARY ===")
+    print(f"Hostname: {report['compute_info']['hostname']}")
+    print(f"Platform: {report['compute_info']['platform']}")
+    
+    # Network summary
+    subnets = report['network_discovery'].get('local_subnets', [])
+    hosts = report['network_discovery'].get('known_hosts', [])
+    print(f"Network: {len(subnets)} subnets, {len(hosts)} hosts discovered")
+    
+    # Kubernetes access
+    k8s_access = report['kubernetes_access'].get('kubernetes_service_accessible', False)
+    print(f"Kubernetes Access: {'Available' if k8s_access else 'Not Available'}")
+    
+    # Managed Identity
+    arm_token = report['managed_identity_access'].get('arm_token_acquired', False)
+    print(f"Managed Identity ARM Access: {'Available' if arm_token else 'Not Available'}")
+    
+    # Container status
+    in_container = report['container_escape'].get('in_container', False)
+    print(f"Container Status: {'Inside Container' if in_container else 'Not in Container'}")
+    
+    # Metadata services
+    imds_access = report['metadata_services'].get('azure_imds', {}).get('accessible', False)
+    print(f"IMDS Access: {'Available' if imds_access else 'Not Available'}")
+    
+    # Credential leaks
+    cred_count = report['credential_leaks'].get('credential_files', {}).get('count', 0)
+    print(f"Potential Credential Files: {cred_count}")
+    
+    # Storage access
+    storage_token = report['storage_access'].get('storage_token_acquired', False)
+    storage_accounts = len(report['storage_access'].get('storage_accounts_found', []))
+    print(f"Storage Access: {'Available' if storage_token else 'Not Available'} ({storage_accounts} accounts found)")
+    
+    # AML specific
+    ml_workspaces = 0
+    if 'ml_workspaces' in report.get('aml_specific', {}):
+        for sub_id, sub_data in report['aml_specific']['ml_workspaces'].items():
+            ml_workspaces += sub_data.get('count', 0)
+    
+    print(f"Azure ML Workspaces Accessible: {ml_workspaces}")
+    
+    # Identify critical findings for lateral movement
+    print("\n=== CRITICAL LATERAL MOVEMENT VECTORS ===")
+    
+    critical_findings = []
+    
+    # Check for docker socket access (container escape)
+    if report['container_escape'].get('docker_socket_mounted', False):
+        critical_findings.append("Docker socket mounted - potential container escape")
+    
+    # Check for privileged container
+    privileged = any(v.get('writable', False) for k, v in 
+                    report['container_escape'].get('privileged_indicators', {}).items())
+    if privileged:
+        critical_findings.append("Container running in privileged mode - potential host access")
+    
+    # Check for suspicious mounts
+    if report['container_escape'].get('suspicious_mounts', []):
+        critical_findings.append(f"Suspicious host paths mounted: {len(report['container_escape']['suspicious_mounts'])} found")
+    
+    # Check for unprotected services
+    for service, data in report['unprotected_services'].get('localhost', {}).items():
+        if data.get('accessible', False):
+            critical_findings.append(f"Unprotected {service} service accessible locally")
+    
+    # Check for exposed services on subnet
+    if 'live_hosts' in report['unprotected_services'].get('subnet_scan', {}):
+        live_host_count = len(report['unprotected_services']['subnet_scan']['live_hosts'])
+        if live_host_count > 1:  # More than just localhost
+            critical_findings.append(f"Multiple live hosts ({live_host_count}) found on local subnet")
+            
+            # Check for critical ports
+            critical_port_hosts = []
+            for host, port_data in report['unprotected_services']['subnet_scan'].get('port_scan', {}).items():
+                for port, port_info in port_data.items():
+                    if port_info.get('state', '') == 'OPEN' and port in [22, 6379, 6443, 10250, 27017]:
+                        critical_port_hosts.append(f"{host}:{port}")
+            
+            if critical_port_hosts:
+                critical_findings.append(f"Critical ports open on network: {', '.join(critical_port_hosts[:5])}")
+    
+    # Check for storage account access
+    storage_results = report['storage_access'].get('storage_access_results', {})
+    for account, account_data in storage_results.items():
+        if account_data.get('containers', {}).get('accessible', False):
+            critical_findings.append(f"Storage account {account} containers accessible")
+    
+    # Check for kubernetes access
+    if report['kubernetes_access'].get('kubernetes_service_accessible', False):
+        critical_findings.append("Kubernetes API accessible")
+    
+    # Check for AML workspace access
+    if 'ml_workspaces' in report.get('aml_specific', {}):
+        for sub_id, sub_data in report['aml_specific']['ml_workspaces'].items():
+            for ws in sub_data.get('workspaces', []):
+                if ws.get('compute_access', {}).get('accessible', False):
+                    critical_findings.append(f"AML workspace {ws['name']} compute resources accessible")
+    
+    # Print critical findings
+    if critical_findings:
+        for finding in critical_findings:
+            print(f"- {finding}")
+    else:
+        print("No critical lateral movement vectors identified")
+    
+    return report
+
+if __name__ == "__main__":
+    try:
+        report = run_lateral_movement_assessment()
+    except Exception as e:
+        print(f"Error during lateral movement assessment: {str(e)}")
+        traceback.print_exc()
+        sys.exit(1)
