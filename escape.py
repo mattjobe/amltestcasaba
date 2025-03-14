@@ -349,13 +349,126 @@ def main():
     print(f"Container: {'Yes' if summary['is_container'] else 'No'}")
     print(f"Risk Level: {summary['risk_level']} ({summary['risk_score']}/20)")
     print(f"Escape Potential: {'Yes' if summary['escape_potential'] else 'No'}")
-    print("\n== Risk Factors ==")
-    print(f"Privileged Writable Paths: {summary['privileged_writable_paths']}")
-    print(f"Docker Socket Access: {'Yes' if summary['docker_socket_access'] else 'No'}")
-    print(f"Dangerous Capabilities: {summary['dangerous_capabilities']}")
-    print(f"Cgroup Escape Potential: {'Yes' if summary['cgroup_escape_potential'] else 'No'}")
-    print(f"Suspicious Mounts: {summary['suspicious_mounts']}")
-    print(f"Sensitive Device Access: {summary['sensitive_device_access']}")
+    
+    # Print detailed findings section by section
+    print("\n=== DETAILED FINDINGS ===")
+    
+    # Container Detection Details
+    print("\n[1] CONTAINER DETECTION")
+    for key, value in results["container_detection"].items():
+        print(f"  {key}: {value}")
+    
+    # Privileged Indicators
+    print("\n[2] PRIVILEGED MODE INDICATORS")
+    for path, details in results["privileged_indicators"].items():
+        if isinstance(details, dict):
+            status = "🔴 WRITABLE" if details.get("writable") else "⚠️ EXISTS" if details.get("exists") else "✅ NOT FOUND"
+            print(f"  {path}: {status}")
+        else:
+            print(f"  {path}: {details}")
+    
+    # Volume Mounts
+    print("\n[3] SUSPICIOUS VOLUME MOUNTS")
+    if "docker_sock_mounted" in results["volume_mounts"]:
+        print(f"  Docker socket mounted: {'🔴 YES' if results['volume_mounts']['docker_sock_mounted'] else '✅ NO'}")
+    
+    if "suspicious_host_mounts" in results["volume_mounts"]:
+        if results["volume_mounts"]["suspicious_host_mounts"]:
+            print("  Suspicious host mounts detected:")
+            for mount in results["volume_mounts"]["suspicious_host_mounts"]:
+                print(f"    🔴 {mount}")
+        else:
+            print("  ✅ No suspicious host mounts detected")
+    
+    # Capabilities
+    print("\n[4] DANGEROUS CAPABILITIES")
+    if "dangerous_found" in results["capabilities"]:
+        if results["capabilities"]["dangerous_found"]:
+            print("  Dangerous capabilities detected:")
+            for cap in results["capabilities"]["dangerous_found"]:
+                print(f"    🔴 {cap}")
+        else:
+            print("  ✅ No dangerous capabilities detected")
+    
+    if "is_privileged" in results["capabilities"]:
+        print(f"  Full capabilities (=ep): {'🔴 YES' if results['capabilities']['is_privileged'] else '✅ NO'}")
+    
+    if "effective" in results["capabilities"]:
+        print(f"  Effective capabilities: {results['capabilities']['effective']}")
+    
+    # Cgroup Escape
+    print("\n[5] CGROUP ESCAPE POTENTIAL")
+    cgroup_vulnerable = results["cgroup_escape"].get("cgroup_release_agent_writable", False)
+    print(f"  Cgroup release_agent writable: {'🔴 YES' if cgroup_vulnerable else '✅ NO'}")
+    
+    for path, writable in results["cgroup_escape"].items():
+        if path != "cgroup_release_agent_writable":
+            print(f"  {path}: {'🔴 WRITABLE' if writable else '✅ NOT WRITABLE'}")
+    
+    # Socket Access
+    print("\n[6] SENSITIVE SOCKET ACCESS")
+    socket_found = False
+    for sock_path, details in results["sockets_access"].items():
+        if details.get("exists"):
+            socket_found = True
+            access = []
+            if details.get("readable"):
+                access.append("readable")
+            if details.get("writable"):
+                access.append("writable")
+            
+            if access:
+                print(f"  🔴 {sock_path}: {', '.join(access)}")
+            else:
+                print(f"  ⚠️ {sock_path}: exists but not accessible")
+    
+    if not socket_found:
+        print("  ✅ No sensitive sockets accessible")
+    
+    # Kernel Modules
+    print("\n[7] KERNEL MODULE LOADING")
+    can_load = results["kernel_modules"].get("likely_can_load_modules", False)
+    print(f"  Can likely load kernel modules: {'🔴 YES' if can_load else '✅ NO'}")
+    print(f"  Modprobe available: {'⚠️ YES' if results['kernel_modules'].get('modprobe_available') else 'NO'}")
+    print(f"  Insmod available: {'⚠️ YES' if results['kernel_modules'].get('insmod_available') else 'NO'}")
+    
+    # Device Access
+    print("\n[8] SENSITIVE DEVICE ACCESS")
+    device_found = False
+    for dev_path, details in results["device_access"].items():
+        if details.get("exists"):
+            device_found = True
+            access = []
+            if details.get("readable"):
+                access.append("readable")
+            if details.get("writable"):
+                access.append("writable")
+            
+            if access:
+                print(f"  🔴 {dev_path}: {', '.join(access)}")
+            else:
+                print(f"  ⚠️ {dev_path}: exists but not accessible")
+    
+    if not device_found:
+        print("  ✅ No sensitive devices accessible")
+    
+    # Summary of risk factors
+    print("\n=== ESCAPE VECTORS SUMMARY ===")
+    if summary['privileged_writable_paths'] > 0:
+        print(f"🔴 PRIVILEGED MODE: {summary['privileged_writable_paths']} writable privileged paths")
+    if summary['docker_socket_access']:
+        print("🔴 DOCKER SOCKET: Access to Docker socket allows container escape")
+    if summary['dangerous_capabilities'] > 0:
+        print(f"🔴 CAPABILITIES: {summary['dangerous_capabilities']} dangerous capabilities detected")
+    if summary['cgroup_escape_potential']:
+        print("🔴 CGROUP ESCAPE: Writable cgroup release_agent could be exploited")
+    if summary['suspicious_mounts'] > 0:
+        print(f"🔴 HOST MOUNTS: {summary['suspicious_mounts']} suspicious host mounts detected")
+    if summary['sensitive_device_access'] > 0:
+        print(f"🔴 DEVICE ACCESS: {summary['sensitive_device_access']} sensitive devices accessible")
+    
+    if summary['risk_level'] == "LOW":
+        print("\n✅ RESULT: No significant container escape vectors detected")
     
     # Save detailed results
     output_file = "container_escape_assessment.json"
@@ -366,14 +479,19 @@ def main():
     
     if summary['risk_level'] in ["CRITICAL", "HIGH"]:
         print("\n⚠️ WARNING: Container has HIGH escape potential!")
+        print("\nPOSSIBLE ESCAPE METHODS:")
         if summary['privileged_writable_paths'] > 0:
-            print("- Container appears to be running in privileged mode")
+            print("- PRIVILEGED MODE: Use kernel modules or devices to break out")
+            print("  Example: Writing to /dev/mem or /proc/sys/kernel")
         if summary['docker_socket_access']:
-            print("- Docker socket access could allow container breakout")
+            print("- DOCKER SOCKET: Use Docker API to spawn privileged container")
+            print("  Example: docker run --privileged -v /:/host alpine chroot /host")
         if summary['cgroup_escape_potential']:
-            print("- Writable cgroup release_agent could allow escape")
+            print("- CGROUP RELEASE_AGENT: Write to release_agent to execute commands")
         if summary['suspicious_mounts'] > 0:
-            print("- Suspicious host mounts detected")
+            print("- HOST MOUNTS: Access host file system through mounted directories")
+    elif summary['risk_level'] == "MEDIUM":
+        print("\n⚠️ CAUTION: Container has MEDIUM escape potential")
     
     return 0
 
