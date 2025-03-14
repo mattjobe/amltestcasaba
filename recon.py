@@ -873,7 +873,11 @@ class HostRecon:
             kernel = self.findings["host_system_info"].get("kernel", "Unknown")
             
             print(f"[+] Host hostname: {hostname}")
-            print(f"[+] OS: {os_release.split('PRETTY_NAME=')[1].strip('"') if 'PRETTY_NAME=' in os_release else os_release}")            
+            if 'PRETTY_NAME=' in os_release:
+                os_name = os_release.split('PRETTY_NAME=')[1].strip('"')
+                print(f"[+] OS: {os_name}")
+            else:
+                print(f"[+] OS: {os_release}")
             print(f"[+] Kernel: {kernel}")
             
         # Users
